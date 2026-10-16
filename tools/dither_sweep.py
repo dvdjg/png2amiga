@@ -227,6 +227,15 @@ for depth in (5, 6, 7, 8):
         f'hires-aga-d{depth}', 'amiga', 640, 200, AMIGA_IMAGES, EXAMPLES,
         extra_args=['--mode', 'hires', '--chipset', 'aga', '--depth', str(depth)],
     ))
+for mode, chipset, depth in [('lores', 'ocs', d) for d in (2, 3, 4, 5)] + \
+        [('lores', 'aga', d) for d in (4, 5, 6, 7, 8)] + \
+        [('hires', 'ocs', d) for d in (3, 4)]:
+    tag = '' if chipset == 'ocs' else 'aga-'
+    AMIGA_MODES.append(ModeSpec(
+        f'{mode}-{tag}d{depth}-sliced', 'amiga', 640 if mode == 'hires' else 320, 200,
+        AMIGA_IMAGES, EXAMPLES,
+        extra_args=['--mode', mode, '--chipset', chipset, '--depth', str(depth), '--sliced'],
+    ))
 AMIGA_MODES += [
     ModeSpec('ham6', 'amiga', 320, 200, AMIGA_IMAGES, EXAMPLES),
     ModeSpec('ham8', 'amiga', 320, 200, AMIGA_IMAGES, EXAMPLES,
