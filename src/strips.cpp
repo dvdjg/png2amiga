@@ -734,7 +734,8 @@ Result<ScapResult> encode_strips_dpf_ocs(
         sliced_vertical_dither,
         dpf_dither_excluded,
         /*quantizer_override=*/std::nullopt,
-        sliced_beam);
+        sliced_beam,
+        /*dither_checked=*/false);
     if (!copper_result) return std::unexpected{copper_result.error()};
     auto& sliced_palettes = copper_result->scanline_palettes;
     auto& base_palette_vec = copper_result->base_palette;
