@@ -287,9 +287,9 @@ SwapCandidate find_best_swap(std::span<const Color3f> current_pal,
 // Two candidate colors are tried per slot: the base cluster's centroid
 // (best for cluster k alone), and the half-brite cluster's centroid
 // doubled in sRGB (best for cluster k+32 alone). Whichever gives the
-// larger combined-cluster error reduction wins. With one tiebreak: if
-// cluster k+32 is empty, only the base centroid is tried; if cluster k
-// is empty, only the doubled half centroid.
+// larger combined-cluster error reduction wins. If cluster k+32 is
+// empty, only the base centroid is tried; if cluster k is (near-)empty,
+// the slot is left alone (see kTwinCaptureMinBase).
 SwapCandidate find_best_swap_ehb(std::span<const color_space::OKLab> current_lab,
                                  std::span<const std::span<const color_space::OKLab>> rows_lab,
                                  SwapScratch& sc,
@@ -342,7 +342,15 @@ SwapCandidate find_best_swap_ehb(std::span<const color_space::OKLab> current_lab
                                   static_cast<float>(stats[k].sum_b / count_b)};
             try_candidate(color_space::oklab_to_linear(cb).clamped());
         }
-        if (count_h > 0.001) {
+        // The half-brite twin may only re-aim a slot whose base half still
+        // serves pixels here. Otherwise a slot idle on these rows (e.g. the
+        // white highlight base) gets captured for its twin's cluster, and
+        // since candidates only come from cluster centroids, nothing ever
+        // proposes the base colour again: later rows lose it and dither
+        // clips to the next-darker entry (DIV2K 0041: S2 -17 vs plain EHB).
+        // Same 0.5 weighted-px emptiness bar as kStealEmptyThreshold.
+        constexpr double kTwinCaptureMinBase = 0.5;
+        if (count_h > 0.001 && count_b >= kTwinCaptureMinBase) {
             color_space::OKLab ch{static_cast<float>(stats[k + kBase].sum_L / count_h),
                                   static_cast<float>(stats[k + kBase].sum_a / count_h),
                                   static_cast<float>(stats[k + kBase].sum_b / count_h)};
