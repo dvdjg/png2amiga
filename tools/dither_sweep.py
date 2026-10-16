@@ -217,6 +217,16 @@ for depth in (2, 3, 4):
         f'hires-d{depth}', 'amiga', 640, 200, AMIGA_IMAGES, EXAMPLES,
         extra_args=['--mode', 'hires', '--depth', str(depth)],
     ))
+for depth in (7, 8):
+    AMIGA_MODES.append(ModeSpec(
+        f'lores-aga-d{depth}', 'amiga', 320, 200, AMIGA_IMAGES, EXAMPLES,
+        extra_args=['--mode', 'lores', '--chipset', 'aga', '--depth', str(depth)],
+    ))
+for depth in (5, 6, 7, 8):
+    AMIGA_MODES.append(ModeSpec(
+        f'hires-aga-d{depth}', 'amiga', 640, 200, AMIGA_IMAGES, EXAMPLES,
+        extra_args=['--mode', 'hires', '--chipset', 'aga', '--depth', str(depth)],
+    ))
 AMIGA_MODES += [
     ModeSpec('ham6', 'amiga', 320, 200, AMIGA_IMAGES, EXAMPLES),
     ModeSpec('ham8', 'amiga', 320, 200, AMIGA_IMAGES, EXAMPLES,
@@ -224,7 +234,21 @@ AMIGA_MODES += [
     ModeSpec('ehb',  'amiga', 320, 200, AMIGA_IMAGES, EXAMPLES),
 ]
 
-ALL_MODES = AMIGA_MODES + BLOCK_MODES
+# Single-palette fixed-buffer modes outside the Amiga/block families
+# (dither::apply or per-line raster encoders). ED methods only.
+OTHER_MODES: list[ModeSpec] = [
+    ModeSpec(name, 'other', w, h, AMIGA_IMAGES, EXAMPLES,
+             methods=ERROR_DIFFUSION + STRUCTURE_AWARE)
+    for name, w, h in [
+        ('stf-low', 320, 200), ('ste-low', 320, 200),
+        ('stf-med', 640, 200), ('ste-med', 640, 200),
+        ('vga-13h', 320, 200), ('vga-12h', 640, 480), ('gba-mode4', 240, 160),
+        ('msx2-screen5', 256, 212), ('cpc-plus-mode0', 160, 200),
+        ('stf-spectrum512', 320, 199), ('ste-spectrum4096', 320, 199),
+    ]
+]
+
+ALL_MODES = AMIGA_MODES + BLOCK_MODES + OTHER_MODES
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +453,9 @@ def main() -> int:
                         '"Encoded:" status line.')
     p.add_argument('--quick', action='store_true',
                    help='Smoke run: 3 strengths, opt-checker + floyd-steinberg only')
+    p.add_argument('--image-dir', help='Override the source image directory')
+    p.add_argument('--images', help='CSV of source images in --image-dir '
+                                    '(overrides each mode\'s image list)')
     p.add_argument('--work-dir', help='Cache dir for resized inputs and outputs '
                                        '(default: tempfile)')
     args = p.parse_args()
@@ -464,6 +491,13 @@ def main() -> int:
         modes = BLOCK_MODES
     else:
         modes = [m for m in BLOCK_MODES if m.family == args.family]
+
+    if args.image_dir or args.images:
+        modes = [ModeSpec(m.name, m.family, m.width, m.height,
+                          parse_csv(args.images) if args.images else m.images,
+                          Path(args.image_dir) if args.image_dir else m.image_dir,
+                          m.methods, m.extra_args)
+                 for m in modes]
 
     work_ctx = None
     if args.work_dir:
