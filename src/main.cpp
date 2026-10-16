@@ -10382,6 +10382,16 @@ int run_main(int argc, char* argv[]) {
             !config->copper && !config->scap && config->palette_file.empty() &&
             reserve_count_std == 0 && !has_transparency) {
             pal.colors.resize(pal_size);
+            palette_pairs::joint_refit(*image,
+                                       pal.colors,
+                                       dither_result,
+                                       std_locked,
+                                       chipset == amiga::Chipset::aga,
+                                       false,
+                                       [&](const std::vector<Color3f>& p) {
+                                           return dither::apply(
+                                               *image, std::span<const Color3f>(p), dith);
+                                       });
             palette_pairs::refine(*image, pal.colors, dither_result, dith, std_locked, chipset);
             pal_span = std::span<const Color3f>(pal.colors);
         }

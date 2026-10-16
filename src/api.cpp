@@ -1000,6 +1000,16 @@ Result<PlainAutoTrial> encode_plain_auto(const Image& img,
         depth >= 2 && depth <= 8 &&
         !use_dpf && reserve_count == 0 && !has_transparency) {
         out.pal.colors.resize(out.pal_size);
+        palette_pairs::joint_refit(img,
+                                   out.pal.colors,
+                                   dr,
+                                   out.locked_mask,
+                                   chipset == amiga::Chipset::aga,
+                                   false,
+                                   [&](const std::vector<Color3f>& p) {
+                                       return dither::apply(
+                                           img, std::span<const Color3f>(p), dith);
+                                   });
         palette_pairs::refine(img, out.pal.colors, dr, dith, out.locked_mask, chipset);
         pal_span = std::span<const Color3f>(out.pal.colors);
     }
@@ -3820,6 +3830,16 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 // exposed by the baseline encoder and comparison harness.
                 palette_locks::sort_by_brightness(ehb_pal.colors, base_locked,
                                                   dither_result.indices, 32, true);
+                palette_pairs::joint_refit(*image,
+                                           ehb_pal.colors,
+                                           dither_result,
+                                           base_locked,
+                                           false,
+                                           true,
+                                           [&](const std::vector<Color3f>& p) {
+                                               return encode_palette(
+                                                   std::span<const Color3f>(p));
+                                           });
                 palette_pairs::refine_ehb(*image, ehb_pal.colors, dither_result,
                                           base_locked, encode_palette);
                 base_pal.colors.assign(ehb_pal.colors.begin(), ehb_pal.colors.begin() + 32);

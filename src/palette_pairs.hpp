@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <set>
+#include <vector>
 
 // Joint palette updates estimated from spatial color mixing. Candidate pixels
 // always come from the caller's unchanged dither, never from free pixel edits.
@@ -199,6 +200,174 @@ inline void refine_search(const Image& source,
         best = score;
         colors = std::move(palette_winner);
         output = std::move(winner);
+    }
+}
+// Solves A x = b in place for symmetric positive definite A (n x n) and three
+// right-hand sides (b is n x 3). Returns false when A is not positive definite.
+inline bool cholesky_solve3(std::vector<double>& a, std::vector<double>& b, std::size_t n) {
+    for (std::size_t j = 0; j < n; ++j) {
+        double s = a[j * n + j];
+        for (std::size_t k = 0; k < j; ++k)
+            s -= a[j * n + k] * a[j * n + k];
+        if (s <= 1e-12) return false;
+        a[j * n + j] = std::sqrt(s);
+        for (std::size_t i = j + 1; i < n; ++i) {
+            double t = a[i * n + j];
+            for (std::size_t k = 0; k < j; ++k)
+                t -= a[i * n + k] * a[j * n + k];
+            a[i * n + j] = t / a[j * n + j];
+        }
+    }
+    for (std::size_t c = 0; c < 3; ++c) {
+        for (std::size_t i = 0; i < n; ++i) {
+            double t = b[i * 3 + c];
+            for (std::size_t k = 0; k < i; ++k)
+                t -= a[i * n + k] * b[k * 3 + c];
+            b[i * 3 + c] = t / a[i * n + i];
+        }
+        for (std::size_t i = n; i-- > 0;) {
+            double t = b[i * 3 + c];
+            for (std::size_t k = i + 1; k < n; ++k)
+                t -= a[k * n + i] * b[k * 3 + c];
+            b[i * 3 + c] = t / a[i * n + i];
+        }
+    }
+    return true;
+}
+// Joint refit of every unlocked entry against the blurred dithered result.
+// Works in sRGB, the space where error diffusion keeps local means, with a
+// 5x5 binomial blur. Solves all entries at once (ridge toward the current
+// palette), re-encodes with the caller's exact encoder at steps 0.5 and 1.0,
+// and keeps a step only if S2 improves; up to 4 iterations. EHB: `colors`
+// holds 64 entries, the half-brite twin enters at gain 0.5 (exact in sRGB)
+// and is re-derived from its base. Runs before refine / refine_ehb.
+template<class Encode>
+inline void joint_refit(const Image& source,
+                        std::vector<Color3f>& colors,
+                        dither::DitherResult& output,
+                        const std::vector<bool>& locked,
+                        bool aga,
+                        bool ehb,
+                        Encode encode) {
+    const auto w = source.width(), h = source.height(), n = w * h;
+    if (output.indices.size() != n || colors.size() < 2 || colors.size() > 256) return;
+    if (ehb && colors.size() != 64) return;
+    const auto kb = ehb ? std::size_t{32} : colors.size();
+    constexpr int kIterations = 4;
+    constexpr int r = 2;
+    constexpr std::array<float, 5> taps{1 / 16.0f, 4 / 16.0f, 6 / 16.0f, 4 / 16.0f, 1 / 16.0f};
+    auto to_s = [](Color3f lin) { return color_space::linear_to_srgb(lin.clamped()).clamped(); };
+    std::vector<Color3f> src_s(n);
+    for (std::size_t i = 0; i < n; ++i)
+        src_s[i] = to_s(source.pixels()[i]);
+    ssimulacra2::PrecomputedSource reference;
+    reference.prepare(source.pixels(), w, h);
+    auto score = [&](const std::vector<Color3f>& pal, const std::vector<std::uint8_t>& idx) {
+        std::vector<Color3f> px(idx.size());
+        for (std::size_t i = 0; i < idx.size(); ++i)
+            px[i] = pal[idx[i]];
+        return ssimulacra2::compute(reference, px);
+    };
+    float best = score(colors, output.indices);
+    if (!std::isfinite(best)) return;
+    auto is_locked = [&](std::size_t k) { return k < locked.size() && locked[k]; };
+    for (int it = 0; it < kIterations; ++it) {
+        std::vector<double> gram(kb * kb, 0.0), rhs(kb * 3, 0.0);
+        std::vector<float> wts(kb, 0.0f);
+        std::vector<std::size_t> active;
+        for (std::size_t y = 0; y < h; ++y)
+            for (std::size_t x = 0; x < w; ++x) {
+                active.clear();
+                Color3f target{};
+                for (int dy = -r; dy <= r; ++dy)
+                    for (int dx = -r; dx <= r; ++dx) {
+                        int xx = std::clamp(static_cast<int>(x) + dx, 0, static_cast<int>(w) - 1);
+                        int yy = std::clamp(static_cast<int>(y) + dy, 0, static_cast<int>(h) - 1);
+                        auto q = static_cast<std::size_t>(yy) * w + static_cast<std::size_t>(xx);
+                        float a = taps[static_cast<std::size_t>(dx + r)] *
+                                  taps[static_cast<std::size_t>(dy + r)];
+                        auto idx = output.indices[q];
+                        auto k = ehb ? static_cast<std::size_t>(idx % 32) : std::size_t{idx};
+                        float g = (ehb && idx >= 32) ? 0.5f : 1.0f;
+                        if (wts[k] == 0.0f) active.push_back(k);
+                        wts[k] += a * g;
+                        target += src_s[q] * a;
+                    }
+                for (auto a : active) {
+                    rhs[a * 3 + 0] += static_cast<double>(wts[a] * target.r);
+                    rhs[a * 3 + 1] += static_cast<double>(wts[a] * target.g);
+                    rhs[a * 3 + 2] += static_cast<double>(wts[a] * target.b);
+                    for (auto b : active)
+                        gram[a * kb + b] +=
+                            static_cast<double>(wts[a]) * static_cast<double>(wts[b]);
+                }
+                for (auto a : active)
+                    wts[a] = 0.0f;
+            }
+        // Locked or unused entries stay fixed: their terms move to the rhs.
+        std::vector<Color3f> cur_s(kb);
+        for (std::size_t k = 0; k < kb; ++k)
+            cur_s[k] = to_s(colors[k]);
+        std::vector<std::size_t> free_idx;
+        std::vector<bool> is_free(kb, false);
+        for (std::size_t k = 0; k < kb; ++k)
+            if (!is_locked(k) && gram[k * kb + k] > 1e-3) {
+                free_idx.push_back(k);
+                is_free[k] = true;
+            }
+        const auto m = free_idx.size();
+        if (m == 0) return;
+        std::vector<double> A(m * m), B(m * 3);
+        for (std::size_t i = 0; i < m; ++i) {
+            const auto a = free_idx[i];
+            for (std::size_t c = 0; c < 3; ++c) {
+                double v = rhs[a * 3 + c];
+                for (std::size_t b = 0; b < kb; ++b)
+                    if (!is_free[b]) {
+                        const float cb = c == 0 ? cur_s[b].r : c == 1 ? cur_s[b].g : cur_s[b].b;
+                        v -= gram[a * kb + b] * static_cast<double>(cb);
+                    }
+                B[i * 3 + c] = v;
+            }
+            for (std::size_t j = 0; j < m; ++j)
+                A[i * m + j] = gram[a * kb + free_idx[j]];
+        }
+        // Ridge toward the current palette keeps sparsely used entries stable.
+        for (std::size_t i = 0; i < m; ++i) {
+            const double lam = 0.05 * A[i * m + i];
+            A[i * m + i] += lam;
+            const auto c = cur_s[free_idx[i]];
+            B[i * 3 + 0] += lam * static_cast<double>(c.r);
+            B[i * 3 + 1] += lam * static_cast<double>(c.g);
+            B[i * 3 + 2] += lam * static_cast<double>(c.b);
+        }
+        if (!cholesky_solve3(A, B, m)) return;
+        float step_best = best;
+        std::vector<Color3f> pal_best;
+        dither::DitherResult out_best;
+        for (float t : {0.5f, 1.0f}) {
+            auto pal = colors;
+            for (std::size_t i = 0; i < m; ++i) {
+                const auto k = free_idx[i];
+                const Color3f sol{static_cast<float>(B[i * 3 + 0]),
+                                  static_cast<float>(B[i * 3 + 1]),
+                                  static_cast<float>(B[i * 3 + 2])};
+                const Color3f s = (cur_s[k] + (sol - cur_s[k]) * t).clamped();
+                pal[k] = snap(color_space::srgb_to_linear(s), aga);
+                if (ehb) pal[k + 32] = palette::half_brite(pal[k]);
+            }
+            auto encoded = encode(pal);
+            const float trial = score(pal, encoded.indices);
+            if (std::isfinite(trial) && trial > step_best + 0.001f) {
+                step_best = trial;
+                pal_best = std::move(pal);
+                out_best = std::move(encoded);
+            }
+        }
+        if (pal_best.empty()) break;
+        best = step_best;
+        colors = std::move(pal_best);
+        output = std::move(out_best);
     }
 }
 // Compare both searches from the original encoding. A two-color step can
