@@ -290,10 +290,24 @@ SwapCandidate find_best_swap(std::span<const Color3f> current_pal,
 // larger combined-cluster error reduction wins. If cluster k+32 is
 // empty, only the base centroid is tried; if cluster k is (near-)empty,
 // the slot is left alone (see kTwinCaptureMinBase).
+//
+// A third candidate returns a moved slot to its seed colour (seed_pal[k],
+// the whole-image EHB palette). Centroid candidates can only follow the
+// pixels a slot already owns, so a colour evicted on some rows never
+// comes back once those rows end: its pixels now sit in a neighbour's
+// cluster. DIV2K 0779: the sky highlight #DEF (slot 31) went to the beak
+// at row 63 and never returned, so the lighter sky below lost its upper
+// dither bracket while slot 30 crept CDE->CEF->DEF one band at a time.
+// The seed candidate is scored with re-assignment (pixels may move into
+// it from any slot, and pixels leaving slot k fall back to their next
+// nearest entry), since the cluster-local score cannot see those pixels.
+// reserved64 flags reserve slots (and their twins) no pixel may use.
 SwapCandidate find_best_swap_ehb(std::span<const color_space::OKLab> current_lab,
                                  std::span<const std::span<const color_space::OKLab>> rows_lab,
                                  SwapScratch& sc,
-                                 const std::vector<bool>& excluded = {}) {
+                                 const std::vector<bool>& excluded,
+                                 std::span<const Color3f> seed_pal,
+                                 const std::vector<bool>& reserved64) {
 
     constexpr std::size_t kBase = 32;
     auto width = rows_lab[0].size();
@@ -308,6 +322,45 @@ SwapCandidate find_best_swap_ehb(std::span<const color_space::OKLab> current_lab
         auto count_b = stats[k].count;
         auto count_h = stats[k + kBase].count;
         if (count_b < 0.001 && count_h < 0.001) continue;
+
+        if (k < seed_pal.size()) {
+            auto seed_lin = palette::quantize_to_ocs(seed_pal[k]);
+            auto c_lab = color_space::linear_to_oklab(seed_lin);
+            const auto& cur = current_lab[k];
+            if (color_space::fma_dist_sq(c_lab.L - cur.L, c_lab.a - cur.a, c_lab.b - cur.b) >
+                1e-8f) {
+                auto h_lab = color_space::linear_to_oklab(palette::half_brite(seed_lin));
+                double reduction = 0.0;
+                for (std::size_t r = 0; r < rows_lab.size(); ++r) {
+                    auto& rl = rows_lab[r];
+                    auto base = r * width;
+                    for (std::size_t x = 0; x < width; ++x) {
+                        auto i = base + x;
+                        const auto& p = rl[x];
+                        float d = std::min(
+                            color_space::fma_dist_sq(p.L - c_lab.L, p.a - c_lab.a, p.b - c_lab.b),
+                            color_space::fma_dist_sq(p.L - h_lab.L, p.a - h_lab.a, p.b - h_lab.b));
+                        auto a = assignments[i];
+                        if (a == k || a == k + kBase) {
+                            for (std::size_t j = 0; j < current_lab.size(); ++j) {
+                                if (j == k || j == k + kBase) continue;
+                                if (!reserved64.empty() && reserved64[j]) continue;
+                                const auto& e = current_lab[j];
+                                d = std::min(
+                                    d, color_space::fma_dist_sq(p.L - e.L, p.a - e.a, p.b - e.b));
+                            }
+                        } else {
+                            d = std::min(d, sc.best_dist[i]);
+                        }
+                        reduction += static_cast<double>(sc.best_dist[i] - d) *
+                                     static_cast<double>(pixel_weights[i]);
+                    }
+                }
+                if (static_cast<float>(reduction) > best.error_reduction) {
+                    best = {k, seed_lin, static_cast<float>(reduction)};
+                }
+            }
+        }
 
         double cur_err = stats[k].total_error + stats[k + kBase].total_error;
 
@@ -896,7 +949,8 @@ Result<CopperResult> encode_copper(const Image& image,
             for (std::size_t s = 0; s < this_row_changes; ++s) {
                 SwapCandidate swap{0, {}, -1.0f};
                 if (is_ehb) {
-                    swap = find_best_swap_ehb(pal_lab, rows_lab, sc, swapped);
+                    swap = find_best_swap_ehb(
+                        pal_lab, rows_lab, sc, swapped, base_pal, planner_excluded);
                 } else {
                     swap = find_best_swap(current_pal,
                                           pal_lab,

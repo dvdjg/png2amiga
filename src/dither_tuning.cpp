@@ -266,7 +266,10 @@ Defaults defaults_for(const Context& ctx) {
 
     // ---- sliced (per-line palette evolution, no strips) ----------------------
     if (ctx.copper) {
-        if (ctx.mode == amiga::Mode::ehb) return Defaults{0.9f, 0.20f};  // mean 37.83
+        // EHB sliced: same strength as plain EHB. 0.9 was swept when the
+        // planner scored mean S2 37.83; at today's ~60 it over-diffuses
+        // across rows whose palettes differ (DIV2K 0267: 35.9 -> 52.7).
+        if (ctx.mode == amiga::Mode::ehb) return Defaults{0.74f, 0.20f};
         if (ctx.mode == amiga::Mode::lores || ctx.mode == amiga::Mode::lores_interlace) {
             if (ctx.chipset == amiga::Chipset::aga) {
                 switch (ctx.depth) {
