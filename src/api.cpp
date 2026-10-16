@@ -997,16 +997,17 @@ Result<PlainAutoTrial> encode_plain_auto(const Image& img,
     if (fit_pairs && palette_pairs::plain_fit_mode(mode) && depth >= 2 && depth <= 8 &&
         reserve_count == 0 && !has_transparency) {
         out.pal.colors.resize(out.pal_size);
-        palette_pairs::joint_refit(img,
-                                   out.pal.colors,
-                                   dr,
-                                   out.locked_mask,
-                                   palette_pairs::grid_for(chipset, mode),
-                                   false,
-                                   [&](const std::vector<Color3f>& p) {
-                                       return dither::apply(
-                                           img, std::span<const Color3f>(p), dith);
-                                   });
+        palette_pairs::joint_refit(
+            img,
+            out.pal.colors,
+            dr,
+            out.locked_mask,
+            palette_pairs::grid_for(chipset, mode),
+            false,
+            [&](const std::vector<Color3f>& p) {
+                return dither::apply(img, std::span<const Color3f>(p), dith);
+            },
+            /*concurrent=*/true);
         palette_pairs::refine(
             img, out.pal.colors, dr, dith, out.locked_mask, palette_pairs::grid_for(chipset, mode));
         pal_span = std::span<const Color3f>(out.pal.colors);
@@ -1871,16 +1872,17 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         } else {
             dith_result = dither::apply(*image, pal.colors, dith);
             if (!has_transparency) {
-                palette_pairs::joint_refit(*image,
-                                           pal.colors,
-                                           dith_result,
-                                           assembled.locked,
-                                           palette_pairs::kVga,
-                                           false,
-                                           [&](const std::vector<Color3f>& p) {
-                                               return dither::apply(
-                                                   *image, std::span<const Color3f>(p), dith);
-                                           });
+                palette_pairs::joint_refit(
+                    *image,
+                    pal.colors,
+                    dith_result,
+                    assembled.locked,
+                    palette_pairs::kVga,
+                    false,
+                    [&](const std::vector<Color3f>& p) {
+                        return dither::apply(*image, std::span<const Color3f>(p), dith);
+                    },
+                    /*concurrent=*/true);
                 palette_pairs::refine(
                     *image, pal.colors, dith_result, dith, assembled.locked, palette_pairs::kVga);
             }
@@ -2751,16 +2753,17 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             } else {
                 dith_result = dither::apply(*image, pal.colors, dith);
                 if (!user_pal && !has_transparency) {
-                    palette_pairs::joint_refit(*image,
-                                               pal.colors,
-                                               dith_result,
-                                               locked_mask,
-                                               palette_pairs::kBgr555,
-                                               false,
-                                               [&](const std::vector<Color3f>& p) {
-                                                   return dither::apply(
-                                                       *image, std::span<const Color3f>(p), dith);
-                                               });
+                    palette_pairs::joint_refit(
+                        *image,
+                        pal.colors,
+                        dith_result,
+                        locked_mask,
+                        palette_pairs::kBgr555,
+                        false,
+                        [&](const std::vector<Color3f>& p) {
+                            return dither::apply(*image, std::span<const Color3f>(p), dith);
+                        },
+                        /*concurrent=*/true);
                     palette_pairs::refine(
                         *image, pal.colors, dith_result, dith, locked_mask, palette_pairs::kBgr555);
                 }
@@ -3866,18 +3869,23 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 // exposed by the baseline encoder and comparison harness.
                 palette_locks::sort_by_brightness(ehb_pal.colors, base_locked,
                                                   dither_result.indices, 32, true);
-                palette_pairs::joint_refit(*image,
-                                           ehb_pal.colors,
-                                           dither_result,
-                                           base_locked,
-                                           palette_pairs::kOcs,
-                                           true,
-                                           [&](const std::vector<Color3f>& p) {
-                                               return encode_palette(
-                                                   std::span<const Color3f>(p));
-                                           });
-                palette_pairs::refine_ehb(*image, ehb_pal.colors, dither_result,
-                                          base_locked, encode_palette);
+                palette_pairs::joint_refit(
+                    *image,
+                    ehb_pal.colors,
+                    dither_result,
+                    base_locked,
+                    palette_pairs::kOcs,
+                    true,
+                    [&](const std::vector<Color3f>& p) {
+                        return encode_palette(std::span<const Color3f>(p));
+                    },
+                    /*concurrent=*/true);
+                palette_pairs::refine_ehb(*image,
+                                          ehb_pal.colors,
+                                          dither_result,
+                                          base_locked,
+                                          encode_palette,
+                                          /*concurrent=*/true);
                 base_pal.colors.assign(ehb_pal.colors.begin(), ehb_pal.colors.begin() + 32);
             }
         }

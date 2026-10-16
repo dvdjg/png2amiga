@@ -106,8 +106,8 @@ Result<EncodeResult> encode(const Image& image, amiga::Mode mode,
             auto encode = [&](const std::vector<Color3f>& p) {
                 return dither::apply(image, std::span<const Color3f>(p), settings);
             };
-            palette_pairs::joint_refit(image, out.palette, d, {}, kRgb333, false, encode);
-            palette_pairs::refine_with(image, out.palette, d, {}, kRgb333, encode);
+            palette_pairs::joint_refit(image, out.palette, d, {}, kRgb333, false, encode, true);
+            palette_pairs::refine_with(image, out.palette, d, {}, kRgb333, encode, true);
             auto base = palette_address(screen);
             for (std::size_t i = 0; i < out.palette.size(); ++i) {
                 auto c = out.palette[i];

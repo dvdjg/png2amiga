@@ -1214,16 +1214,17 @@ Result<CopperResult> encode_copper(const Image& image,
                 base_pal = std::move(refined->colors);
             auto seed_dither = dither::apply(
                 image, std::span<const Color3f>(base_pal), dither_settings);
-            palette_pairs::joint_refit(image,
-                                       base_pal,
-                                       seed_dither,
-                                       base_locked,
-                                       palette_pairs::grid_for(chipset),
-                                       /*ehb=*/false,
-                                       [&](const std::vector<Color3f>& p) {
-                                           return dither::apply(
-                                               image, std::span<const Color3f>(p), dither_settings);
-                                       });
+            palette_pairs::joint_refit(
+                image,
+                base_pal,
+                seed_dither,
+                base_locked,
+                palette_pairs::grid_for(chipset),
+                /*ehb=*/false,
+                [&](const std::vector<Color3f>& p) {
+                    return dither::apply(image, std::span<const Color3f>(p), dither_settings);
+                },
+                /*concurrent=*/true);
             palette_pairs::refine(
                 image, base_pal, seed_dither, dither_settings, base_locked, chipset);
         }

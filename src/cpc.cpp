@@ -304,8 +304,8 @@ Result<EncodeResult> encode(const Image& image,
             return dither::apply(image, std::span<const Color3f>(p), settings);
         };
         const auto& grid = plus ? palette_pairs::kOcs : kFirmwareGrid;
-        palette_pairs::joint_refit(image, inks, dres, {}, grid, false, encode);
-        palette_pairs::refine_with(image, inks, dres, {}, grid, encode);
+        palette_pairs::joint_refit(image, inks, dres, {}, grid, false, encode, true);
+        palette_pairs::refine_with(image, inks, dres, {}, grid, encode, true);
     }
 
     EncodeResult res;

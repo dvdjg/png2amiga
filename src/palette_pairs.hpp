@@ -2,6 +2,7 @@
 #include "console_color.hpp"
 #include "dither.hpp"
 #include "palette.hpp"
+#include "pipeline.hpp"
 #include "ssimulacra2.hpp"
 #include <algorithm>
 #include <array>
@@ -112,11 +113,15 @@ inline std::vector<Proposal> proposals(const Image& source,
     std::vector<Color3f> rhs(k), colors;
     for (auto c : f.palette)
         colors.push_back(space(c, lab));
+    std::vector<Color3f> src(n);
+    for (std::size_t p = 0; p < n; ++p)
+        src[p] = space(source.pixels()[p], lab);
+    // Zero between pixels: only the active entries are reset.
+    std::array<float, 256> weights{};
     // Blurred indicator fields retain how palette entries mix spatially.
     // Off-diagonal terms couple entries that occur together in the filter.
     for (std::size_t p = 0; p < n; ++p) {
         const int x = static_cast<int>(p % w), y = static_cast<int>(p / w);
-        std::array<float, 256> weights{};
         std::array<std::size_t, 9> active{};
         std::size_t active_count = 0;
         Color3f target{}, rendered{};
@@ -135,7 +140,7 @@ inline std::vector<Proposal> proposals(const Image& source,
                 // are re-derived before the full re-encode and S2 comparison.
                 const float response = ehb && f.indices[q] >= 32 ? (lab ? 0.63f : 0.25f) : 1.0f;
                 weights[index] += a * response;
-                target += space(source.pixels()[q], lab) * a;
+                target += src[q] * a;
                 rendered += colors[f.indices[q]] * a;
             }
         auto residual = target - rendered;
@@ -145,6 +150,8 @@ inline std::vector<Proposal> proposals(const Image& source,
                 gram[a * k + b] += static_cast<double>(weights[a]) *
                                    static_cast<double>(weights[b]);
         }
+        for (auto a : std::span(active).first(active_count))
+            weights[a] = 0.0f;
     }
     std::vector<Proposal> out;
     const auto original_key = key(std::span(f.palette).first(k), grid);
@@ -191,59 +198,96 @@ inline std::vector<Proposal> proposals(const Image& source,
     return out;
 }
 
+// Encodes and scores every palette in `pals`; results in input order. With
+// `concurrent` the trials run in parallel, so `encode` must be safe to call
+// from several threads at once.
+template<class Encode, class Score>
+inline void encode_all(const std::vector<const std::vector<Color3f>*>& pals,
+                       Encode& encode,
+                       const Score& score,
+                       bool concurrent,
+                       std::vector<dither::DitherResult>& encoded,
+                       std::vector<float>& scores) {
+    encoded.clear();
+    encoded.resize(pals.size());
+    scores.assign(pals.size(), 0.0f);
+    auto one = [&](std::size_t i) {
+        encoded[i] = encode(*pals[i]);
+        scores[i] = score(*pals[i], encoded[i].indices);
+    };
+    if (concurrent && pals.size() > 1) {
+        pipeline::parallel_for(pals.size(), one);
+    } else {
+        for (std::size_t i = 0; i < pals.size(); ++i)
+            one(i);
+    }
+}
+inline float score_indexed(const ssimulacra2::PrecomputedSource& reference,
+                           const std::vector<Color3f>& pal,
+                           const std::vector<std::uint8_t>& idx) {
+    std::vector<Color3f> px(idx.size());
+    for (std::size_t i = 0; i < idx.size(); ++i)
+        px[i] = pal[idx[i]];
+    return ssimulacra2::compute(reference, px);
+}
+// Returns the S2 of the final (colors, output): `best` when nothing is
+// kept or the search does not run.
 template<class Encode>
-inline void refine_search(const Image& source,
-                          std::vector<Color3f>& colors,
-                          dither::DitherResult& output,
-                          Encode& encode,
-                          const std::vector<bool>& locked,
-                          const Grid& grid,
-                          bool paired) {
+inline float refine_search(const Image& source,
+                           std::vector<Color3f>& colors,
+                           dither::DitherResult& output,
+                           Encode& encode,
+                           const std::vector<bool>& locked,
+                           const Grid& grid,
+                           bool paired,
+                           const ssimulacra2::PrecomputedSource& reference,
+                           float best,
+                           bool concurrent) {
     if (colors.size() < 2 || colors.size() > 256 || output.indices.size() != source.pixels().size())
-        return;
+        return best;
     if (std::count(locked.begin(), locked.end(), true) >=
         static_cast<std::ptrdiff_t>(colors.size()) - (paired ? 1 : 0))
-        return;
-    auto render = [&](const std::vector<Color3f>& pal, const std::vector<std::uint8_t>& idx) {
-        Image result(source.width(), source.height());
-        for (std::size_t p = 0; p < idx.size(); ++p)
-            result.pixels()[p] = pal[idx[p]];
-        return result;
+        return best;
+    if (!std::isfinite(best)) return best;
+    auto score_fn = [&](const std::vector<Color3f>& pal, const std::vector<std::uint8_t>& idx) {
+        return score_indexed(reference, pal, idx);
     };
-    ssimulacra2::PrecomputedSource reference;
-    reference.prepare(source.pixels(), source.width(), source.height());
-    float best = ssimulacra2::compute(reference, render(colors, output.indices).pixels());
-    if (!std::isfinite(best)) return;
     for (int pass = 0; pass < 2; ++pass) {
         Frame frame{colors, output.indices};
         std::vector<Proposal> candidates;
         std::set<std::vector<int>> seen;
-        for (bool lab : {false, true}) {
+        std::array<std::vector<Proposal>, 2> by_lab;
+        pipeline::parallel_for(2, [&](std::size_t i) {
+            by_lab[i] = proposals(source, frame, locked, i == 1, grid, false, paired);
+        });
+        for (auto& list : by_lab) {
             int added = 0;
-            for (auto& p : proposals(source, frame, locked, lab, grid, false, paired)) {
+            for (auto& p : list) {
                 if (!seen.insert(key(p.palette, grid)).second) continue;
                 candidates.push_back(std::move(p));
                 if (++added == 4) break;
             }
         }
-        auto winner = output;
-        auto palette_winner = colors;
+        std::vector<const std::vector<Color3f>*> pals;
+        for (const auto& p : candidates)
+            pals.push_back(&p.palette);
+        std::vector<dither::DitherResult> encoded;
+        std::vector<float> trials;
+        encode_all(pals, encode, score_fn, concurrent, encoded, trials);
+        std::size_t win = candidates.size();
         float score = best;
-        for (const auto& p : candidates) {
-            auto encoded = encode(p.palette);
-            float trial = ssimulacra2::compute(reference,
-                                               render(p.palette, encoded.indices).pixels());
-            if (std::isfinite(trial) && trial > score + 0.001f) {
-                score = trial;
-                winner = std::move(encoded);
-                palette_winner = p.palette;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (std::isfinite(trials[i]) && trials[i] > score + 0.001f) {
+                score = trials[i];
+                win = i;
             }
         }
         if (score <= best) break;
         best = score;
-        colors = std::move(palette_winner);
-        output = std::move(winner);
+        colors = candidates[win].palette;
+        output = std::move(encoded[win]);
     }
+    return best;
 }
 // Solves A x = b in place for symmetric positive definite A (n x n) and three
 // right-hand sides (b is n x 3). Returns false when A is not positive definite.
@@ -291,7 +335,8 @@ inline void joint_refit(const Image& source,
                         const std::vector<bool>& locked,
                         const Grid& grid,
                         bool ehb,
-                        Encode encode) {
+                        Encode encode,
+                        bool concurrent = false) {
     const auto w = source.width(), h = source.height(), n = w * h;
     if (output.indices.size() != n || colors.size() < 2 || colors.size() > 256) return;
     if (ehb && colors.size() != 64) return;
@@ -306,14 +351,27 @@ inline void joint_refit(const Image& source,
     ssimulacra2::PrecomputedSource reference;
     reference.prepare(source.pixels(), w, h);
     auto score = [&](const std::vector<Color3f>& pal, const std::vector<std::uint8_t>& idx) {
-        std::vector<Color3f> px(idx.size());
-        for (std::size_t i = 0; i < idx.size(); ++i)
-            px[i] = pal[idx[i]];
-        return ssimulacra2::compute(reference, px);
+        return score_indexed(reference, pal, idx);
     };
     float best = score(colors, output.indices);
     if (!std::isfinite(best)) return;
     auto is_locked = [&](std::size_t k) { return k < locked.size() && locked[k]; };
+    // The blurred source does not change between iterations.
+    std::vector<Color3f> blur_s(n);
+    for (std::size_t y = 0; y < h; ++y)
+        for (std::size_t x = 0; x < w; ++x) {
+            Color3f target{};
+            for (int dy = -r; dy <= r; ++dy)
+                for (int dx = -r; dx <= r; ++dx) {
+                    int xx = std::clamp(static_cast<int>(x) + dx, 0, static_cast<int>(w) - 1);
+                    int yy = std::clamp(static_cast<int>(y) + dy, 0, static_cast<int>(h) - 1);
+                    auto q = static_cast<std::size_t>(yy) * w + static_cast<std::size_t>(xx);
+                    float a = taps[static_cast<std::size_t>(dx + r)] *
+                              taps[static_cast<std::size_t>(dy + r)];
+                    target += src_s[q] * a;
+                }
+            blur_s[y * w + x] = target;
+        }
     for (int it = 0; it < kIterations; ++it) {
         std::vector<double> gram(kb * kb, 0.0), rhs(kb * 3, 0.0);
         std::vector<float> wts(kb, 0.0f);
@@ -321,7 +379,7 @@ inline void joint_refit(const Image& source,
         for (std::size_t y = 0; y < h; ++y)
             for (std::size_t x = 0; x < w; ++x) {
                 active.clear();
-                Color3f target{};
+                const Color3f target = blur_s[y * w + x];
                 for (int dy = -r; dy <= r; ++dy)
                     for (int dx = -r; dx <= r; ++dx) {
                         int xx = std::clamp(static_cast<int>(x) + dx, 0, static_cast<int>(w) - 1);
@@ -334,7 +392,6 @@ inline void joint_refit(const Image& source,
                         float g = (ehb && idx >= 32) ? 0.5f : 1.0f;
                         if (wts[k] == 0.0f) active.push_back(k);
                         wts[k] += a * g;
-                        target += src_s[q] * a;
                     }
                 for (auto a : active) {
                     rhs[a * 3 + 0] += static_cast<double>(wts[a] * target.r);
@@ -388,8 +445,11 @@ inline void joint_refit(const Image& source,
         float step_best = best;
         std::vector<Color3f> pal_best;
         dither::DitherResult out_best;
-        for (float t : {0.5f, 1.0f}) {
-            auto pal = colors;
+        std::array<std::vector<Color3f>, 2> steps;
+        for (std::size_t si = 0; si < 2; ++si) {
+            const float t = si == 0 ? 0.5f : 1.0f;
+            auto& pal = steps[si];
+            pal = colors;
             for (std::size_t i = 0; i < m; ++i) {
                 const auto k = free_idx[i];
                 const Color3f sol{static_cast<float>(B[i * 3 + 0]),
@@ -399,12 +459,25 @@ inline void joint_refit(const Image& source,
                 pal[k] = snap(color_space::srgb_to_linear(s), grid);
                 if (ehb) pal[k + 32] = palette::half_brite(pal[k]);
             }
-            auto encoded = encode(pal);
-            const float trial = score(pal, encoded.indices);
-            if (std::isfinite(trial) && trial > step_best + 0.001f) {
-                step_best = trial;
-                pal_best = std::move(pal);
-                out_best = std::move(encoded);
+        }
+        // Trials that cannot be kept are not encoded: a step equal to the
+        // first one scores the same and needs a strictly higher score; after
+        // a kept iteration `output` is encode(colors), so a step equal to
+        // `colors` scores `best`.
+        std::vector<const std::vector<Color3f>*> pals;
+        for (std::size_t si = 0; si < 2; ++si) {
+            if (si == 1 && steps[1] == steps[0]) continue;
+            if (it > 0 && steps[si] == colors) continue;
+            pals.push_back(&steps[si]);
+        }
+        std::vector<dither::DitherResult> encoded;
+        std::vector<float> trials;
+        encode_all(pals, encode, score, concurrent, encoded, trials);
+        for (std::size_t i = 0; i < pals.size(); ++i) {
+            if (std::isfinite(trials[i]) && trials[i] > step_best + 0.001f) {
+                step_best = trials[i];
+                pal_best = *pals[i];
+                out_best = std::move(encoded[i]);
             }
         }
         if (pal_best.empty()) break;
@@ -416,30 +489,39 @@ inline void joint_refit(const Image& source,
 // Compare both searches from the original encoding. A two-color step can
 // escape a local optimum; a single-color step can win in sparse palettes.
 // `encode` maps a palette to the caller's exact indexed encoding.
+// `concurrent`: see encode_all.
 template<class Encode>
 inline void refine_with(const Image& source,
                         std::vector<Color3f>& colors,
                         dither::DitherResult& output,
                         const std::vector<bool>& locked,
                         const Grid& grid,
-                        Encode encode) {
+                        Encode encode,
+                        bool concurrent = false) {
     if (colors.size() < 2 || colors.size() > 256 || output.indices.size() != source.pixels().size())
         return;
-    const auto original_colors = colors;
-    const auto original_output = output;
-    refine_search(source, colors, output, encode, locked, grid, true);
-    auto single_colors = original_colors;
-    auto single_output = original_output;
-    refine_search(source, single_colors, single_output, encode, locked, grid, false);
     ssimulacra2::PrecomputedSource reference;
     reference.prepare(source.pixels(), source.width(), source.height());
-    auto score = [&](const auto& palette, const auto& indices) {
-        std::vector<Color3f> pixels(indices.size());
-        for (std::size_t p = 0; p < indices.size(); ++p)
-            pixels[p] = palette[indices[p]];
-        return ssimulacra2::compute(reference, pixels);
-    };
-    if (score(single_colors, single_output.indices) > score(colors, output.indices)) {
+    // One score of the starting point serves both searches; each returns
+    // the score of what it ends with.
+    const float start = score_indexed(reference, colors, output.indices);
+    const auto original_colors = colors;
+    const auto original_output = output;
+    const float paired_score = refine_search(
+        source, colors, output, encode, locked, grid, true, reference, start, concurrent);
+    auto single_colors = original_colors;
+    auto single_output = original_output;
+    const float single_score = refine_search(source,
+                                             single_colors,
+                                             single_output,
+                                             encode,
+                                             locked,
+                                             grid,
+                                             false,
+                                             reference,
+                                             start,
+                                             concurrent);
+    if (single_score > paired_score) {
         colors = std::move(single_colors);
         output = std::move(single_output);
     }
@@ -450,9 +532,18 @@ inline void refine(const Image& source,
                    const dither::Settings& settings,
                    const std::vector<bool>& locked,
                    const Grid& grid) {
-    refine_with(source, colors, output, locked, grid, [&](const std::vector<Color3f>& p) {
-        return dither::apply(source, std::span<const Color3f>(p), settings);
-    });
+    dither::PrecomputedImage pre;
+    pre.build(source);
+    refine_with(
+        source,
+        colors,
+        output,
+        locked,
+        grid,
+        [&](const std::vector<Color3f>& p) {
+            return dither::apply(source, std::span<const Color3f>(p), settings, &pre);
+        },
+        /*concurrent=*/true);
 }
 inline void refine(const Image& source,
                    std::vector<Color3f>& colors,
@@ -470,17 +561,15 @@ inline void refine_ehb(const Image& source,
                        std::vector<Color3f>& colors,
                        dither::DitherResult& output,
                        const std::vector<bool>& locked,
-                       Encode encode) {
+                       Encode encode,
+                       bool concurrent = false) {
     if (colors.size() != 64 || output.indices.size() != source.pixels().size()) return;
     const auto seed_colors = colors;
     const auto seed_output = output;
     ssimulacra2::PrecomputedSource reference;
     reference.prepare(source.pixels(), source.width(), source.height());
-    auto score = [&](const auto& pal, const auto& indices) {
-        std::vector<Color3f> pixels(indices.size());
-        for (std::size_t i = 0; i < indices.size(); ++i)
-            pixels[i] = pal[indices[i]];
-        return ssimulacra2::compute(reference, pixels);
+    auto score = [&](const std::vector<Color3f>& pal, const std::vector<std::uint8_t>& indices) {
+        return score_indexed(reference, pal, indices);
     };
     const float baseline = score(colors, output.indices);
     if (!std::isfinite(baseline)) return;
@@ -501,22 +590,24 @@ inline void refine_ehb(const Image& source,
                     if (++added == 4) break;
                 }
             }
-            auto winner = current_output;
-            auto winner_colors = current_colors;
+            std::vector<const std::vector<Color3f>*> pals;
+            for (const auto& p : candidates)
+                pals.push_back(&p.palette);
+            std::vector<dither::DitherResult> encoded;
+            std::vector<float> trials;
+            encode_all(pals, encode, score, concurrent, encoded, trials);
+            std::size_t win = candidates.size();
             float next = best;
-            for (const auto& p : candidates) {
-                auto encoded = encode(p.palette);
-                const float trial = score(p.palette, encoded.indices);
-                if (std::isfinite(trial) && trial > next + 0.001f) {
-                    next = trial;
-                    winner = std::move(encoded);
-                    winner_colors = p.palette;
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                if (std::isfinite(trials[i]) && trials[i] > next + 0.001f) {
+                    next = trials[i];
+                    win = i;
                 }
             }
             if (next <= best) break;
             best = next;
-            current_output = std::move(winner);
-            current_colors = std::move(winner_colors);
+            current_output = std::move(encoded[win]);
+            current_colors = candidates[win].palette;
         }
         if (best > overall) {
             overall = best;
