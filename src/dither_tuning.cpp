@@ -258,6 +258,8 @@ Defaults defaults_for(const Context& ctx) {
     if (ctx.scap) {
         if (ctx.dpf) return Defaults{0.9f, 0.10f};                       // 8 colors
         if (ctx.mode == amiga::Mode::ehb) return Defaults{0.9f, 0.10f};  // 64 effective
+        // Plain lores 1-4 planes: same 2-16 color shape as DPF, no sweep.
+        if (ctx.mode == amiga::Mode::lores && ctx.depth <= 4) return Defaults{0.9f, 0.10f};
         return kFallback;
     }
 

@@ -6,6 +6,7 @@
 #include "ham.hpp"
 #include "types.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -182,6 +183,36 @@ inline const ScapSlotTable kStrips6bplHam6{
         {248 + kHAM6}, {264 + kHAM6}, {280 + kHAM6}, {296 + kHAM6},
     }};
 
+// kStrips4bplLores — OCS lores, 1-4 bitplanes, 320 px display.
+//
+// With at most 4 lores planes, bitplane DMA uses only odd cycles, so the
+// copper gets every even cycle: one MOVE per 4 CCK = 8 lores px. The
+// plane count does not change the timing for 1-4 planes.
+//
+// Calibrated on Copperline (A500 OCS, 68000) with --strips-debug, where
+// each stripe edge is one MOVE landing. MOVE k lands at x = 8k-13 for
+// gate 0x38, 8k-9 for 0x3A, 8k-5 for 0x3C and 8k-1 for 0x3E: a landing
+// moves in 4-px steps, so the grid can only sit at 8k-1 or 8k+3.
+// 39 slots, not 40: a 40-MOVE chain from 0x3C or later ends after the
+// line wraps, so line 255's end-of-line WAIT (VP $FF) is checked on line
+// 256 (VP $00) and the copper stalls for the rest of the frame. 39 MOVEs
+// from 0x3E end with the same margin as the working 40-from-0x3A chain.
+// Slot 0 (preload) lands at x=-1, slot k>0 at x = 8k-1.
+inline const ScapSlotTable kStrips4bplLores{
+    /*total_planes=*/4,
+    /*line_gate_hpos=*/0x3E,
+    /*end_of_line_hpos=*/0xE1,
+    /*slots=*/
+    {
+        {0},   {7},   {15},  {23},  {31},  {39},  {47},  {55},  {63},  {71},  {79},  {87},  {95},
+        {103}, {111}, {119}, {127}, {135}, {143}, {151}, {159}, {167}, {175}, {183}, {191}, {199},
+        {207}, {215}, {223}, {231}, {239}, {247}, {255}, {263}, {271}, {279}, {287}, {295}, {303},
+    }};
+
+// Upper bound on slots per table; planner beam nodes size their per-slot
+// decision arrays from it.
+constexpr std::size_t kMaxStripsSlots = 48;
+
 // Deferred — populated when we run an AGA probe.
 inline const ScapSlotTable kStrips8bplAga{
     /*total_planes=*/8,
@@ -192,6 +223,32 @@ inline const ScapSlotTable kStrips8bplAga{
 
 inline const ScapSlotTable& strips_table_for(int total_planes) {
     return (total_planes == 8) ? kStrips8bplAga : kStrips6bplOcs;
+}
+
+// Strips variant per (mode, dpf): slot table, copper-list label and the
+// CLI mode name. Single source for the encoder dispatch and every export.
+struct StripsVariant {
+    amiga::Mode mode;
+    bool dpf;
+    const ScapSlotTable* table;
+    std::string_view label;
+    std::string_view name;
+};
+
+inline const std::array<StripsVariant, 4> kStripsVariants{{
+    {amiga::Mode::lores, true, &kStrips6bplOcs, "strips_dpf_ocs", "OCS DPF"},
+    {amiga::Mode::lores, false, &kStrips4bplLores, "strips_lores_ocs", "OCS lores"},
+    {amiga::Mode::ehb, false, &kStrips6bplEhb, "strips_ehb_ocs", "OCS EHB 6bpp"},
+    {amiga::Mode::ham6, false, &kStrips6bplHam6, "strips_ham6_ocs", "OCS HAM6"},
+}};
+
+// nullptr when (mode, dpf) has no strips variant. dpf only selects
+// between the two lores rows.
+inline const StripsVariant* strips_variant_for(amiga::Mode mode, bool dpf) {
+    const bool lores_dpf = dpf && mode == amiga::Mode::lores;
+    for (const auto& v : kStripsVariants)
+        if (v.mode == mode && v.dpf == lores_dpf) return &v;
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +376,34 @@ Result<ScapResult> encode_strips_dpf_ocs(
     // sliced base pass that seeds the per-
     // line palette state. See `sliced_beam`
     // on copper::encode_copper.
+    bool sliced_beam = false);
+
+// ---------------------------------------------------------------------------
+// strips for plain OCS lores, 1-4 bitplanes (2-16 colors, COLOR00..).
+//
+// Same planner as encode_strips_dpf_ocs, on the kStrips4bplLores 8-px
+// grid and the plain register layout (index k = COLORk). reserved_slots /
+// locked_slots use palette indices 0..2^depth-1 directly. debug_overlay
+// emits the stripe calibration pattern instead of an encode.
+// ---------------------------------------------------------------------------
+Result<ScapResult> encode_strips_lores_ocs(
+    const Image& image,
+    int width,
+    int height,
+    int depth,
+    bool lock_color0 = true,
+    const dither::Settings& dither_settings = {},
+    bool debug_overlay = false,
+    std::size_t copper_changes_override = 0,
+    int palette_diversity = 0,
+    std::function<void(float, std::string_view)> on_progress = {},
+    bool enable_best = false,
+    int sliced_spread_radius = -1,
+    float sliced_spread_decay = -1.0f,
+    bool sliced_vertical_dither = false,
+    std::span<const Color3f> external_palette = {},
+    const std::vector<std::pair<std::size_t, Color3f>>& reserved_slots = {},
+    const std::vector<std::pair<std::size_t, Color3f>>& locked_slots = {},
     bool sliced_beam = false);
 
 // ---------------------------------------------------------------------------

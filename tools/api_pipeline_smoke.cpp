@@ -16,7 +16,7 @@
 //   --error-clamp <f>
 //   --lock-color0 / --no-lock-color0
 //   --interlace
-//   --copper-changes <K>
+//   --slice-changes <K>
 //   --raw-out <path>       also write EncodeState::raw_frame
 //   --pal-out <path>       also write the CPC companion .pal bytes
 //   <input.png> <output.png>
@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
         else if (a == "--chipset") opts.chipset = std::string(next(a));
         else if (a == "--lock-color0") opts.lock_color0 = true;
         else if (a == "--no-lock-color0") opts.lock_color0 = false;
-        else if (a == "--copper-changes") opts.copper_changes = std::atoi(std::string(next(a)).c_str());
+        else if (a == "--slice-changes") opts.copper_changes = std::atoi(std::string(next(a)).c_str());
         else if (a == "--dither") opts.dither = std::string(next(a));
         else if (a == "--dither-strength") {
             opts.dither_strength = std::stof(std::string(next(a)));

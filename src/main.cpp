@@ -1265,7 +1265,7 @@ void print_usage() {
         "                                  0xFFDF line-255 wrap marker.\n"
         "\n"
         "Strip palette (mid-line swaps, OCS lores):\n"
-        "  --strips                        Mid-line swaps; pair with --dpf or ehb\n"
+        "  --strips                        Mid-line swaps (lores 1-4 planes, --dpf, ehb, ham6)\n"
         "\n"
         "Seamless tile:\n"
         "  --tile                          Replicate input 3x3 before dither, export center\n"
@@ -1652,11 +1652,6 @@ Result<Config> parse_args(int argc, char* argv[]) {
         }
         if (arg == "--strips") {
             config.scap = true;
-            // strips defaults to DPF (the production mode). The lores 5bpp
-            // investigation path needs --depth 5 + no --dpf — let that
-            // through by NOT auto-enabling DPF here. The post-parse fixup
-            // below auto-enables DPF only when the user didn't pick a
-            // 5bpp lores configuration.
             continue;
         }
         if (arg == "--strips-debug") {
@@ -2436,9 +2431,11 @@ Result<Config> parse_args(int argc, char* argv[]) {
         std::exit(exit_code::usage);  // NOLINT(concurrency-mt-unsafe)
     }
 
-    // strips post-parse fixup. Three supported configurations:
+    // strips post-parse fixup. Supported configurations:
+    //   * lores: --strips, OCS lores depth 1-4, 2-16 colors.
     //   * DPF: --strips --dpf, OCS lores depth=3, 8 PF2 colors.
     //   * EHB: --strips --mode ehb, 32 base + 32 hardware half-brite.
+    //   * HAM6: --strips --mode ham6.
     // No auto-promotion — the user must opt into one of the supported
     // strips regimes explicitly. The CLI block below errors out otherwise.
 
@@ -8693,15 +8690,14 @@ int run_main(int argc, char* argv[]) {
                 out.scanline_changes = &st.scanline_changes;
                 out.changes_per_line = st.changes_per_line;
             }
-            // HAM+strips: 6-plane mid-line MOVE table. HAM6 has its own slot
-            // table (kStrips6bplHam6); HAM other depths reuse the OCS table.
+            // HAM6+strips: 6-plane mid-line MOVE table (strips is HAM6-only).
             if (config->scap && !st.strips_line_moves.empty()) {
-                out.strips_line_moves = &st.strips_line_moves;
-                bool strips_ham6 = config->mode == amiga::Mode::ham6;
-                auto& table = strips_ham6 ? strips::kStrips6bplHam6 : strips::kStrips6bplOcs;
-                out.strips_label = strips_ham6 ? "strips_ham6_ocs" : "strips_dpf_ocs";
-                out.strips_anchor_hpos = table.line_gate_hpos;
-                out.strips_total_planes = table.total_planes;
+                if (const auto* variant = strips::strips_variant_for(config->mode, false)) {
+                    out.strips_line_moves = &st.strips_line_moves;
+                    out.strips_label = std::string(variant->label);
+                    out.strips_anchor_hpos = variant->table->line_gate_hpos;
+                    out.strips_total_planes = variant->table->total_planes;
+                }
             }
             int rc = write_amiga_output(out);
             if (rc != 0) return rc;
@@ -9584,24 +9580,23 @@ int run_main(int argc, char* argv[]) {
     }
 
     // --- strips (mid-line palette swaps) ---
-    // Two paths:
-    //   * DPF (production): --strips + --dpf + OCS lores depth=3 → 8 PF2
-    //     colors, full cpp viewer export.
-    //   * Lores 5bpp (investigation): --strips + OCS lores depth=5 (no
-    //     --dpf) → 32 colors, single playfield, PNG preview only,
-    //     no copper-list cpp output yet.
+    // Paths (HAM6 is handled by the HAM branch above):
+    //   * lores: --strips + OCS lores depth 1-4 → 2-16 colors, 8-px grid.
+    //   * DPF: --strips + --dpf + OCS lores depth=3 → 8 PF2 colors.
+    //   * EHB: --strips + --mode ehb → 32 base + 32 half-brites.
     if (config->scap) {
         bool strips_ehb = config->mode == amiga::Mode::ehb;
         bool strips_dpf = use_dpf_std && config->mode == amiga::Mode::lores;
-        // HAM6+strips is handled by the HAM branch above, so the gate here
-        // only needs to cover the EHB/DPF combos. Keep the error wording
-        // explicit about all three legal forms.
-        if ((!strips_dpf && !strips_ehb) || chipset != amiga::Chipset::ocs || config->interlace) {
+        bool strips_lores = !config->dual_playfield && config->mode == amiga::Mode::lores &&
+                            config->depth >= 1 && config->depth <= 4;
+        if ((!strips_dpf && !strips_ehb && !strips_lores) || chipset != amiga::Chipset::ocs ||
+            config->interlace) {
             std::println(stderr,
-                         "Error: --strips requires OCS (no interlace) with either "
-                         "--dpf lores depth=3, --mode ehb, or --mode ham6.");
+                         "Error: --strips requires OCS (no interlace) with --mode lores "
+                         "depth 1-4, --dpf lores depth=3, --mode ehb, or --mode ham6.");
             return 1;
         }
+        const auto* variant = strips::strips_variant_for(config->mode, strips_dpf);
         if (has_transparency) {
             for (std::size_t i = 0; i < transparency_mask.size(); ++i)
                 if (transparency_mask[i]) image->pixels()[i] = Color3f{0, 0, 0};
@@ -9630,7 +9625,9 @@ int run_main(int argc, char* argv[]) {
         }
         auto& st = enc.state;
 
-        const char* strips_label = strips_ehb ? "OCS EHB 6bpp" : "OCS DPF";
+        std::string strips_label = strips_lores
+                                       ? std::format("{} {}bpp", variant->name, config->depth)
+                                       : std::string(variant->name);
         cli_print_mode(std::format("Strips ({}, {} slots, {:.1f} useful swaps/line)",
                                    strips_label,
                                    st.strips_slot_count,
@@ -9643,6 +9640,8 @@ int run_main(int argc, char* argv[]) {
                             st.palette.size(),
                             st.palette.size() * 2,
                             resolve_quantizer_name(config->mode, chipset, config->quantizer)));
+        } else if (strips_lores) {
+            cli_print_palette(std::format("{} colors (auto, ocs-optimal)", st.palette.size()));
         } else {
             // DPF strips: st.palette is the 16-entry COLOR00..15 register
             // layout (output_palette in scap.cpp). OCS DPF uses both
@@ -9729,10 +9728,9 @@ int run_main(int argc, char* argv[]) {
             out.mask_layout = config->mask_layout;
             out.mask_invert = config->mask_invert;
             out.strips_line_moves = &st.strips_line_moves;
-            out.strips_label = strips_ehb ? "strips_ehb_ocs" : "strips_dpf_ocs";
-            auto& table = strips_ehb ? strips::kStrips6bplEhb : strips::kStrips6bplOcs;
-            out.strips_anchor_hpos = table.line_gate_hpos;
-            out.strips_total_planes = table.total_planes;
+            out.strips_label = std::string(variant->label);
+            out.strips_anchor_hpos = variant->table->line_gate_hpos;
+            out.strips_total_planes = variant->table->total_planes;
             out.allow_iff = false;
             out.allow_raw = false;
             out.allow_pal = false;

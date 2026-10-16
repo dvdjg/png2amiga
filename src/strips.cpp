@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <optional>
 #include <cmath>
 #include <cstdint>
@@ -507,10 +508,46 @@ float lab_error(const color_space::OKLab& a, const color_space::OKLab& b) {
     return color_space::fma_dist_sq(a.L - b.L, a.a - b.a, a.b - b.b);
 }
 
+// Register layout of the indexed (SET-only) strips planner.
+//   dpf:   OCS DPF PF2. Index 0 falls through to COLOR00 (dual-written to
+//          COLOR08 for AGA PF2OF=011); index k>0 → COLOR(8+k). Planes are
+//          expanded to 6-plane DPF with PF1 zero.
+//   plain: OCS lores, index k → COLORk.
+// max_hblank_moves caps the per-line reset. Lores: 13 measured on
+// Copperline; 14 delays the 39-MOVE chain by 2 CCK and the late chain end
+// cascades into the next line.
+struct IndexedLayout {
+    const ScapSlotTable* table;
+    bool dpf;
+    std::size_t max_hblank_moves;
+};
+constexpr IndexedLayout kDpfLayout{
+    &kStrips6bplOcs, true, copper::max_changes_per_line(3, false, false, amiga::Chipset::ocs)};
+constexpr IndexedLayout kLoresLayout{&kStrips4bplLores, false, 13};
+
+// Registers to write for palette index k (-1 = unused entry).
+constexpr std::array<int, 2> layout_regs(const IndexedLayout& layout, std::size_t k) {
+    if (!layout.dpf) return {static_cast<int>(k), -1};
+    return (k == 0) ? std::array<int, 2>{0, 8} : std::array<int, 2>{static_cast<int>(8 + k), -1};
+}
+
+// Palette index a single-register MOVE targets, or -1 (DPF index 0 is a
+// dual write and never targeted alone; neither are filler registers).
+constexpr int layout_index(const IndexedLayout& layout, unsigned reg, std::size_t colors) {
+    if (layout.dpf) return (reg >= 9 && reg <= 15) ? static_cast<int>(reg - 8) : -1;
+    return (reg < colors) ? static_cast<int>(reg) : -1;
+}
+
 }  // namespace
 
+static Result<ScapResult> encode_scap_stripes_debug(const ScapSlotTable& table,
+                                                    std::size_t width,
+                                                    std::size_t height,
+                                                    std::size_t depth,
+                                                    std::size_t palette_size);
+
 // ---------------------------------------------------------------------------
-// Planner — OCS DPF, 6-plane lores 320 px.
+// Planner — OCS DPF (6-plane) and plain OCS lores (1-4 planes), 320 px.
 //
 // Stage 1 seeds a sliced entry palette, then uses a bounded beam to choose
 // a register/color for each calibrated MOVE slot. Two-strip lookahead lets
@@ -520,7 +557,9 @@ float lab_error(const color_space::OKLab& a, const color_space::OKLab& b) {
 // Stage 2 dithers the whole image against these evolving palettes, so error
 // diffusion crosses strip and row boundaries without restarting its texture.
 // ---------------------------------------------------------------------------
-Result<ScapResult> encode_strips_dpf_ocs(
+template<std::size_t kBaseColors>
+static Result<ScapResult> encode_strips_indexed(
+    const IndexedLayout& layout,
     const Image& image,
     int width_arg,
     int height_arg,
@@ -565,23 +604,24 @@ Result<ScapResult> encode_strips_dpf_ocs(
             palette_diversity,
             /*jitter_count=*/24,
             [&](const Image& jittered_in, const dither::Settings& d, int div) {
-                return encode_strips_dpf_ocs(jittered_in,
-                                             width_arg,
-                                             height_arg,
-                                             lock_color0,
-                                             d,
-                                             debug_overlay,
-                                             copper_changes_override,
-                                             div,
-                                             /*on_progress=*/{},
-                                             /*enable_best=*/false,
-                                             sliced_spread_radius,
-                                             sliced_spread_decay,
-                                             sliced_vertical_dither,
-                                             external_palette,
-                                             reserved_slots,
-                                             locked_slots,
-                                             sliced_beam);
+                return encode_strips_indexed<kBaseColors>(layout,
+                                                          jittered_in,
+                                                          width_arg,
+                                                          height_arg,
+                                                          lock_color0,
+                                                          d,
+                                                          debug_overlay,
+                                                          copper_changes_override,
+                                                          div,
+                                                          /*on_progress=*/{},
+                                                          /*enable_best=*/false,
+                                                          sliced_spread_radius,
+                                                          sliced_spread_decay,
+                                                          sliced_vertical_dither,
+                                                          external_palette,
+                                                          reserved_slots,
+                                                          locked_slots,
+                                                          sliced_beam);
             },
             [](const ScapResult& r) -> const Image& { return r.rendered; },
             on_progress,
@@ -591,16 +631,19 @@ Result<ScapResult> encode_strips_dpf_ocs(
         // (shouldn't happen with valid input, but degrade gracefully).
     }
 
-    auto& table = strips_table_for(6);
-    if (table.slots.empty()) {
+    auto& table = *layout.table;
+    if (table.slots.empty() || table.slots.size() > kMaxStripsSlots) {
         return std::unexpected{Error{
             ErrorCode::unsupported_mode,
-            "Strips planner: kStrips6bplOcs slot table is empty",
+            "Strips planner: slot table is empty or too long",
         }};
     }
 
     auto width = (width_arg > 0) ? static_cast<std::size_t>(width_arg) : image.width();
     auto height = (height_arg > 0) ? static_cast<std::size_t>(height_arg) : image.height();
+    if (debug_overlay && !layout.dpf)
+        return encode_scap_stripes_debug(
+            table, width, height, std::bit_width(kBaseColors) - 1, kBaseColors);
     if (image.width() != width || image.height() != height) {
         return std::unexpected{Error{
             ErrorCode::invalid_dimensions,
@@ -654,39 +697,42 @@ Result<ScapResult> encode_strips_dpf_ocs(
     // strips layers on top of sliced. With only 8 PF2 colors the per-line
     // search space is tiny, but sliced still finds useful palette diffs
     // against neighbor scanlines.
-    constexpr int kBaseColors = 8;  // PF2 width = 3 bitplanes
-    // PF2 index → COLOR-register mapping:
+    constexpr std::size_t kDepth = std::bit_width(kBaseColors) - 1;
+    // Index → COLOR-register mapping (layout_regs):
     //   * OCS DPF combiner rule: PF2 index 0 falls through to COLOR00
     //     (the "both PFs zero → background" case). Indices 1..7 use the
     //     implicit +8 offset → COLOR09..15. COLOR08 is unused on OCS.
     //   * AGA DPF with BPLCON3 PF2OF=011: index 0 → COLOR08, indices
     //     1..7 → COLOR09..15.
-    // The cpp viewer needs to work on both chipsets, so we write index
+    // The cpp viewer needs to work on both chipsets, so DPF writes index
     // 0 to BOTH COLOR00 and COLOR08 (one of the two is always the live
-    // register depending on chipset). pf2_writes(k) returns the list
-    // of registers that must be written for PF2 index k.
-    auto pf2_writes = [](std::size_t k) -> std::array<int, 2> {
-        return (k == 0) ? std::array<int, 2>{0, 8}
-                        : std::array<int, 2>{static_cast<int>(8 + k), -1};
+    // register depending on chipset). Plain lores writes COLORk.
+    auto pf2_writes = [&](std::size_t k) {
+        return layout_regs(layout, k);
     };
-    // Hblank load is fixed at ~9 MOVEs (8 PF2 indices, k=0 dual-writes
-    // COLOR00+COLOR08) re-emitted unconditionally every line, so the sliced
-    // share is whatever the user asked for — bounded by the 14-MOVE OCS
-    // hblank budget. strips swaps live in the visible region and don't
-    // contend for hblank, so no strips share split is needed.
-    constexpr std::size_t kMaxCombined = copper::max_changes_per_line(
-        /*depth=*/3, false, false, amiga::Chipset::ocs, false);
+    // The hblank reset re-emits every index each line (DPF: 9 MOVEs, k=0
+    // dual-writes COLOR00+COLOR08; lores: 2^depth MOVEs) while that fits
+    // the hblank budget (DPF 14, lores 13). Lores depth 4 (16 MOVEs) does
+    // not fit and falls back to the top-N partial reset at the full budget.
+    // strips swaps live in the visible region and don't contend for
+    // hblank, so no strips share split is needed.
+    const std::size_t kMaxCombined = layout.max_hblank_moves;
+    std::size_t full_reset_cost = 0;
+    for (std::size_t k = 0; k < kBaseColors; ++k)
+        for (int reg : pf2_writes(k))
+            full_reset_cost += (reg >= 0) ? 1u : 0u;
+    const bool full_reset = copper_changes_override == 0 && full_reset_cost <= kMaxCombined;
     std::size_t total_budget = (copper_changes_override > 0)
                                    ? std::min<std::size_t>(copper_changes_override, kMaxCombined)
                                    : kMaxCombined;
     std::size_t sliced_share = std::min<std::size_t>(total_budget, 2u);
-    // External-palette plumbing for DPF: --palette gets forwarded as
+    // External-palette plumbing: --palette gets forwarded as
     // encode_copper's user_palette so the sliced base palette is locked
-    // to the user's choice (trimmed to 8 PF2 colors).
+    // to the user's choice (trimmed to kBaseColors).
     std::vector<Color3f> dpf_user_pal;
     if (!external_palette.empty()) {
         dpf_user_pal.assign(external_palette.begin(), external_palette.end());
-        if (dpf_user_pal.size() > 8) dpf_user_pal.resize(8);
+        if (dpf_user_pal.size() > kBaseColors) dpf_user_pal.resize(kBaseColors);
     }
     // --reserve-range + --lock-index plumbing: both pin a PF2 slot's
     // color. Differences:
@@ -696,17 +742,17 @@ Result<ScapResult> encode_strips_dpf_ocs(
     // Both feed encode_copper's `locked` (sliced never re-emits the
     // slot), and both flag the strips swap planner mask so mid-line
     // MOVEs can't overwrite the pinned color.
-    std::array<bool, 8> reserved_mask_dpf{};
+    std::array<bool, kBaseColors> reserved_mask_dpf{};
     std::vector<std::size_t> dpf_dither_excluded;
     dpf_dither_excluded.reserve(reserved_slots.size());
     for (auto& [idx, _] : reserved_slots) {
-        if (idx < 8) {
+        if (idx < kBaseColors) {
             reserved_mask_dpf[idx] = true;
             dpf_dither_excluded.push_back(idx);
         }
     }
     for (auto& [idx, _] : locked_slots) {
-        if (idx < 8) reserved_mask_dpf[idx] = true;
+        if (idx < kBaseColors) reserved_mask_dpf[idx] = true;
     }
     // Combined locked list for encode_copper. Reserves and locks both
     // pin colors; only the dither_excluded vector distinguishes them.
@@ -716,7 +762,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
     copper_locked.insert(copper_locked.end(), locked_slots.begin(), locked_slots.end());
     auto copper_result = copper::encode_copper(
         src,
-        /*depth=*/3,
+        kDepth,
         dither_settings,
         amiga::Chipset::ocs,
         sliced_share,
@@ -766,14 +812,21 @@ Result<ScapResult> encode_strips_dpf_ocs(
     // the parallel worker (each row owns a private copy so the per-
     // row planner is thread-safe).
 
-    // Force k_min=1 for DPF strips regardless of --lock-color0. PF2
+    // k_plan: lowest index a mid-line MOVE may target. k_pick: lowest
+    // index a pixel may select.
+    //
+    // DPF: both 1, regardless of --lock-color0. PF2
     // index 0 maps to COLOR00 on OCS and COLOR08 on AGA (per BPLCON3
     // PF2OF=011) — keeping the two in sync mid-line would require
     // emitting two MOVEs per swap, which would shift subsequent slot
     // positions on the bus. Frame-init + per-line sliced MOVEs (both in
     // hblank) handle the dual-write without timing impact, so strips
     // simply never picks k=0 and the planner targets k=1..7.
-    std::size_t k_min = 1u;
+    //
+    // Plain lores: no dual write. Pixels may use COLOR00; mid-line MOVEs
+    // may target it unless --lock-color0 pins it.
+    const std::size_t k_plan = (layout.dpf || lock_color0) ? 1u : 0u;
+    const std::size_t k_pick = layout.dpf ? 1u : 0u;
 
     // Stage-2 error diffusion setup. Honors the user's --dither choice
     // by pulling the diffusion kernel from dither.hpp. The buffer is
@@ -791,7 +844,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
     // keep the policy flags here.
 
     constexpr int kVStart = 44;
-    constexpr std::uint8_t kFillerReg = 31;  // COLOR31 — unread in OCS DPF 3+3
+    constexpr std::uint8_t kFillerReg = 31;  // COLOR31 — unread in DPF 3+3 and lores <=4 planes
     constexpr std::uint16_t kFillerVal = 0x0000;
     double total_error = 0.0;
     std::size_t total_moves = 0;
@@ -879,7 +932,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
         for (std::size_t k = 0; k < kBaseColors; ++k)
             hw_state_init[k] = base_palette[k];
         auto hw_state = hw_state_init;
-        bool serial_path = (copper_changes_override > 0);
+        bool serial_path = !full_reset;
         auto run_row = [&](std::size_t y) {
             // Per-call local hw_state. Serial mode pulls from the outer
             // shared hw_state (carry-over); parallel mode uses init
@@ -915,27 +968,28 @@ Result<ScapResult> encode_strips_dpf_ocs(
 
             // 1. Per-line sliced MOVEs in HBLANK.
             //
-            //   Default (copper_changes_override == 0): unconditionally
-            //   re-emit all 8 PF2 base colors (≤9 hblank MOVEs; k=0
-            //   dual-writes COLOR00+COLOR08, k=1..7 single MOVE each),
-            //   well below the 14-MOVE OCS hblank capacity. Whatever
+            //   full_reset (default when it fits): unconditionally
+            //   re-emit all base colors (DPF ≤9 hblank MOVEs; k=0
+            //   dual-writes COLOR00+COLOR08, k=1..7 single MOVE each;
+            //   lores ≤8), within the hblank budget. Whatever
             //   registers strips polluted on line y-1 get fully overwritten
             //   before line y's visible region starts.
             //
-            //   --slice-changes N > 0: cap HBLANK to N MOVEs total. Diff
+            //   --slice-changes N > 0 (or a reset that does not fit):
+            //   cap HBLANK to N (default: the budget) MOVEs total. Diff
             //   target vs the previous line's target in OKLab; emit MOVEs
             //   for the top-N most-changed slots (k=0 costs 2 of the
             //   budget, others cost 1). Slots not emitted carry the
             //   previous line's value into strip 0 of this line — the
             //   strips visible-area swaps still get to evolve them.
-            //   strips's k_min=1 means slot 0 isn't touched mid-line, so
+            //   DPF's k_plan=1 means slot 0 isn't touched mid-line, so
             //   carrying its prev value is safe; for slots 1..7 the
             //   approximation (assume prev line landed near its sliced
             //   target, ignore strips residue) is good enough that rows
             //   stay independent for parallel_for.
             std::array<bool, kBaseColors> emitted{};
-            if (copper_changes_override == 0) {
-                // Full reset path (default; 9 hblank MOVEs).
+            if (full_reset) {
+                // Full reset path (default; DPF 9 hblank MOVEs).
                 for (std::size_t k = 0; k < kBaseColors; ++k) {
                     auto regs = pf2_writes(k);
                     for (int reg : regs) {
@@ -946,8 +1000,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                     emitted[k] = true;
                 }
             } else {
-                std::size_t hblank_budget = std::min<std::size_t>(copper_changes_override,
-                                                                  kMaxCombined);
+                std::size_t hblank_budget = total_budget;
                 // Score per-slot diff in OKLab² between actual hw_state
                 // (the color the chip is sitting on at end of line y-1)
                 // and target = sliced_palettes[y]. Top-K wins emit-budget.
@@ -965,9 +1018,9 @@ Result<ScapResult> encode_strips_dpf_ocs(
                 for (auto& d : diffs) {
                     if (d.second <= 0.0f) break;  // no further differences
                     auto k = static_cast<std::size_t>(d.first);
-                    std::size_t cost = (k == 0) ? 2 : 1;  // dual-write for k=0
-                    if (move_cost + cost > hblank_budget) continue;
                     auto regs = pf2_writes(k);
+                    std::size_t cost = (regs[1] >= 0) ? 2 : 1;  // DPF k=0 dual-write
+                    if (move_cost + cost > hblank_budget) continue;
                     for (int reg : regs) {
                         if (reg < 0) continue;
                         line_moves[y].push_back(make_move(
@@ -1140,7 +1193,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                     auto& soa = strip_pixels_soa[s];
                     if (soa.valid_n == 0) return 0.0;
                     reset_pixel_min(tl_pixel_min_dpf, soa);
-                    for (std::size_t k = k_min; k < kBaseColors; ++k) {
+                    for (std::size_t k = k_pick; k < kBaseColors; ++k) {
                         min_dist_update(
                             soa, P_lab_v[k].L, P_lab_v[k].a, P_lab_v[k].b, tl_pixel_min_dpf.data());
                     }
@@ -1156,8 +1209,8 @@ Result<ScapResult> encode_strips_dpf_ocs(
             struct BeamNode {
                 std::array<Color3f, kBaseColors> P;
                 std::array<color_space::OKLab, kBaseColors> P_lab;
-                std::array<int, 32> dec_reg{};
-                std::array<Color3f, 32> dec_color{};
+                std::array<int, kMaxStripsSlots> dec_reg{};
+                std::array<Color3f, kMaxStripsSlots> dec_color{};
                 double cum_err = 0;
                 double rank_err = 0;
             };
@@ -1208,12 +1261,12 @@ Result<ScapResult> encode_strips_dpf_ocs(
                     moves.reserve(kBaseColors * st.cands.size());
 
                     auto& soa_pixels = strip_pixels_soa[s + 1];
-                    for (std::size_t k = k_min; k < kBaseColors; ++k) {
+                    for (std::size_t k = k_plan; k < kBaseColors; ++k) {
                         // --reserve-range: skip locked PF2 slots so the mid-line
                         // strips planner can't overwrite the user's fixed color.
                         if (reserved_mask_dpf[k]) continue;
                         reset_pixel_min(tl_pixel_min_dpf, soa_pixels);
-                        for (std::size_t k2 = k_min; k2 < kBaseColors; ++k2) {
+                        for (std::size_t k2 = k_pick; k2 < kBaseColors; ++k2) {
                             if (k2 == k) continue;
                             min_dist_update(soa_pixels,
                                             state.P_lab[k2].L,
@@ -1227,7 +1280,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                              ++h) {
                             auto& future_soa = strip_pixels_soa[s + 1 + h];
                             reset_pixel_min(future_min[h - 1], future_soa);
-                            for (std::size_t k2 = k_min; k2 < kBaseColors; ++k2) {
+                            for (std::size_t k2 = k_pick; k2 < kBaseColors; ++k2) {
                                 if (k2 == k) continue;
                                 min_dist_update(future_soa,
                                                 state.P_lab[k2].L,
@@ -1247,7 +1300,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                                 const auto& guard_target =
                                     img_lab[y * width + static_cast<std::size_t>(gx)];
                                 float other = std::numeric_limits<float>::max();
-                                for (std::size_t j = k_min; j < kBaseColors; ++j) {
+                                for (std::size_t j = k_pick; j < kBaseColors; ++j) {
                                     if (j == k) continue;
                                     other = std::min(other,
                                                      lab_error(guard_target, state.P_lab[j]));
@@ -1332,7 +1385,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
             // Initial palette entries and visible writes are separate variables;
             // pixel assignments and RGB444 representatives alternate (Lloyd).
             // This does not change the calibrated MOVE schedule or its budget.
-            if (!debug_overlay && copper_changes_override == 0) {
+            if (!debug_overlay && full_reset) {
                 const std::size_t nvars = kBaseColors + table.slots.size();
                 std::vector<Color3f> colors(nvars);
                 std::vector<bool> mutable_color(nvars, false);
@@ -1340,7 +1393,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                 for (std::size_t k = 0; k < kBaseColors; ++k) {
                     active[k] = k;
                     colors[k] = P[k];
-                    mutable_color[k] = k >= k_min && !reserved_mask_dpf[k] &&
+                    mutable_color[k] = k >= k_plan && !reserved_mask_dpf[k] &&
                                        external_palette.empty();
                 }
                 std::vector<std::array<std::size_t, kBaseColors>> variables(num_strips, active);
@@ -1375,9 +1428,9 @@ Result<ScapResult> encode_strips_dpf_ocs(
                     for (std::size_t x = 0; x < width; ++x) {
                         const auto& ids = variables[x_strip[x]];
                         const auto& target_lab = img_lab[y * width + x];
-                        std::size_t chosen = ids[k_min];
+                        std::size_t chosen = ids[k_pick];
                         float min_error = std::numeric_limits<float>::max();
-                        for (std::size_t k = k_min; k < kBaseColors; ++k) {
+                        for (std::size_t k = k_pick; k < kBaseColors; ++k) {
                             if (fit_mask[x] & (std::uint32_t{1} << k)) continue;
                             const auto& lab = labs[ids[k]];
                             const float err = color_space::fma_dist_sq(
@@ -1413,9 +1466,9 @@ Result<ScapResult> encode_strips_dpf_ocs(
                 strip_palettes[0] = P;
                 strip_pal_lab[0] = P_lab;
                 for (auto& op : line_moves[y]) {
-                    if (op.kind == ScapOpKind::kMove && op.slot_index < 0 && op.reg >= 9 &&
-                        op.reg <= 15)
-                        op.rgb_ocs = palette::linear_to_ocs(P[op.reg - 8]);
+                    if (op.kind != ScapOpKind::kMove || op.slot_index >= 0) continue;
+                    const int k = layout_index(layout, op.reg, kBaseColors);
+                    if (k >= 0) op.rgb_ocs = palette::linear_to_ocs(P[static_cast<std::size_t>(k)]);
                 }
                 for (std::size_t s = 0; s < table.slots.size(); ++s)
                     if (best.dec_reg[s] >= 0) best.dec_color[s] = colors[kBaseColors + s];
@@ -1429,9 +1482,10 @@ Result<ScapResult> encode_strips_dpf_ocs(
                     Color3f col = best.dec_color[s];
                     P[reg_idx] = col;
                     P_lab[reg_idx] = color_space::linear_to_oklab(col);
-                    line_moves[y].push_back(make_move(static_cast<std::uint8_t>(8 + reg_idx),
-                                                      palette::linear_to_ocs(col),
-                                                      static_cast<int>(s)));
+                    line_moves[y].push_back(
+                        make_move(static_cast<std::uint8_t>(pf2_writes(reg_idx)[0]),
+                                  palette::linear_to_ocs(col),
+                                  static_cast<int>(s)));
                     total_moves_atomic.fetch_add(1);
                 }
                 strip_palettes[s + 1] = P;
@@ -1471,17 +1525,18 @@ Result<ScapResult> encode_strips_dpf_ocs(
         // Copper/Denise transition positions can differ by a lores pixel.
         // Do not select the register being written around a slot boundary:
         // every remaining register has the same color on both sides.
-        std::vector<std::uint8_t> boundary_mask(width * height, 0);
+        std::vector<std::uint16_t> boundary_mask(width * height, 0);
         for (std::size_t y = 0; y < height; ++y) {
             for (const auto& op : line_moves[y]) {
-                if (op.kind != ScapOpKind::kMove || op.slot_index < 0 || op.reg < 9 || op.reg > 15)
-                    continue;
+                if (op.kind != ScapOpKind::kMove || op.slot_index < 0) continue;
+                const int k = layout_index(layout, op.reg, kBaseColors);
+                if (k < 0) continue;
                 const int landing = table.slots[static_cast<std::size_t>(op.slot_index)].pixel_x;
                 for (int x = std::max(0, landing - kDpfGuardRadius);
                      x <= landing + kDpfGuardRadius && static_cast<std::size_t>(x) < width;
                      ++x)
                     boundary_mask[y * width + static_cast<std::size_t>(x)] |=
-                        static_cast<std::uint8_t>(1u << (op.reg - 8));
+                        static_cast<std::uint16_t>(1u << k);
             }
         }
 
@@ -1508,7 +1563,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                     std::array<std::size_t, kBaseColors> mapping{};
                     std::size_t allowed_count = 0;
                     if (excluded != 0) {
-                        for (std::size_t c = k_min; c < kBaseColors; ++c) {
+                        for (std::size_t c = k_pick; c < kBaseColors; ++c) {
                             if ((excluded & (1u << c)) != 0) continue;
                             mapping[allowed_count] = c;
                             allowed[allowed_count++] = pl_lab[c];
@@ -1521,7 +1576,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                                                                       x,
                                                                       y,
                                                                       dither_settings.strength,
-                                                                      excluded != 0 ? 0 : k_min,
+                                                                      excluded != 0 ? 0 : k_pick,
                                                                       k,
                                                                       chosen);
                     if (excluded != 0) k = mapping[k];
@@ -1556,7 +1611,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
                     if ((excluded & (1u << index)) != 0) {
                         const auto& target = img_lab[y * width + x];
                         float min_error = std::numeric_limits<float>::max();
-                        for (std::size_t k = k_min; k < kBaseColors; ++k) {
+                        for (std::size_t k = k_pick; k < kBaseColors; ++k) {
                             if ((excluded & (1u << k)) != 0) continue;
                             const auto& lab = strip_pal_lab_per_row[y][s][k];
                             const float error = color_space::fma_dist_sq(
@@ -1575,14 +1630,10 @@ Result<ScapResult> encode_strips_dpf_ocs(
     }  // kPasses
     if (on_progress) on_progress(1.0f, "done");
 
-    // ---- 4. 3-plane PF2 encoding, then expand to 6-plane DPF ------------
-    auto enc = bitplane::encode(indices,
-                                width,
-                                height,
-                                /*depth=*/3,
-                                bitplane::Layout::interleaved);
+    // ---- 4. kDepth-plane encoding; DPF expands PF2 to 6-plane DPF -------
+    auto enc = bitplane::encode(indices, width, height, kDepth, bitplane::Layout::interleaved);
     if (!enc) return std::unexpected{enc.error()};
-    auto expanded = bitplane::expand_to_dpf_pf2(*enc);
+    auto expanded = layout.dpf ? bitplane::expand_to_dpf_pf2(*enc) : std::move(enc);
     if (!expanded) return std::unexpected{expanded.error()};
 
     // ---- 5. Output palette: PF2 base entries at OCS DPF addresses -----
@@ -1595,7 +1646,7 @@ Result<ScapResult> encode_strips_dpf_ocs(
     // In debug_overlay mode all entries stay at 0x0000 — together with
     // the forced-zero per-line MOVEs this means the viewer's frame-init
     // writes black to every register and only strips MOVEs change colors.
-    std::vector<Color3f> output_palette(16, Color3f{0.0f, 0.0f, 0.0f});
+    std::vector<Color3f> output_palette(layout.dpf ? 16 : kBaseColors, Color3f{0.0f, 0.0f, 0.0f});
     if (!debug_overlay) {
         for (std::size_t k = 0; k < kBaseColors; ++k) {
             auto regs = pf2_writes(k);
@@ -1699,11 +1750,105 @@ Result<ScapResult> encode_strips_dpf_ocs(
     return res;
 }
 
+Result<ScapResult> encode_strips_dpf_ocs(
+    const Image& image,
+    int width_arg,
+    int height_arg,
+    bool lock_color0,
+    const dither::Settings& dither_settings,
+    bool debug_overlay,
+    std::size_t copper_changes_override,
+    int palette_diversity,
+    std::function<void(float, std::string_view)> on_progress,
+    bool enable_best,
+    int sliced_spread_radius,
+    float sliced_spread_decay,
+    bool sliced_vertical_dither,
+    std::span<const Color3f> external_palette,
+    const std::vector<std::pair<std::size_t, Color3f>>& reserved_slots,
+    const std::vector<std::pair<std::size_t, Color3f>>& locked_slots,
+    bool sliced_beam) {
+    return encode_strips_indexed<8>(kDpfLayout,
+                                    image,
+                                    width_arg,
+                                    height_arg,
+                                    lock_color0,
+                                    dither_settings,
+                                    debug_overlay,
+                                    copper_changes_override,
+                                    palette_diversity,
+                                    std::move(on_progress),
+                                    enable_best,
+                                    sliced_spread_radius,
+                                    sliced_spread_decay,
+                                    sliced_vertical_dither,
+                                    external_palette,
+                                    reserved_slots,
+                                    locked_slots,
+                                    sliced_beam);
+}
+
+Result<ScapResult> encode_strips_lores_ocs(
+    const Image& image,
+    int width_arg,
+    int height_arg,
+    int depth,
+    bool lock_color0,
+    const dither::Settings& dither_settings,
+    bool debug_overlay,
+    std::size_t copper_changes_override,
+    int palette_diversity,
+    std::function<void(float, std::string_view)> on_progress,
+    bool enable_best,
+    int sliced_spread_radius,
+    float sliced_spread_decay,
+    bool sliced_vertical_dither,
+    std::span<const Color3f> external_palette,
+    const std::vector<std::pair<std::size_t, Color3f>>& reserved_slots,
+    const std::vector<std::pair<std::size_t, Color3f>>& locked_slots,
+    bool sliced_beam) {
+    auto run = [&]<std::size_t kColors>() {
+        return encode_strips_indexed<kColors>(kLoresLayout,
+                                              image,
+                                              width_arg,
+                                              height_arg,
+                                              lock_color0,
+                                              dither_settings,
+                                              debug_overlay,
+                                              copper_changes_override,
+                                              palette_diversity,
+                                              std::move(on_progress),
+                                              enable_best,
+                                              sliced_spread_radius,
+                                              sliced_spread_decay,
+                                              sliced_vertical_dither,
+                                              external_palette,
+                                              reserved_slots,
+                                              locked_slots,
+                                              sliced_beam);
+    };
+    switch (depth) {
+    case 1:
+        return run.template operator()<2>();
+    case 2:
+        return run.template operator()<4>();
+    case 3:
+        return run.template operator()<8>();
+    case 4:
+        return run.template operator()<16>();
+    default:
+        return std::unexpected{Error{
+            ErrorCode::invalid_depth,
+            std::format("Strips lores: depth must be 1-4, got {}", depth),
+        }};
+    }
+}
+
 // half_brite() lives in palette.hpp; pull it into this TU's lookup.
 using palette::half_brite;
 
-// EHB strips slot-tuning debug bundle. All bitplane pixels use a
-// single shared register (index 2). Frame-init palette puts that
+// Strips slot-tuning debug bundle (EHB and plain lores). All bitplane
+// pixels use a single shared register (index 2; index 1 at depth 1). Frame-init palette puts that
 // register at black; strips slot s alternates the register between
 // white (s even) and black (s odd) at the slot's MOVE position. Net
 // visual: 16-px-wide black/white stripes with the transition AT the
@@ -1713,32 +1858,38 @@ using palette::half_brite;
 // PF1-style yellow rulers aren't available on EHB (no PF1 layer),
 // so the ruler paints into the bitplane data with index 1 = yellow
 // (locked in sliced). Ruler pixels override the stripe content but
-// give stable x-coord references at 4/8/16-px hierarchy.
-static Result<ScapResult> encode_scap_ehb_debug(std::size_t width, std::size_t height) {
-    auto& table = kStrips6bplEhb;
-    constexpr std::size_t kStripeReg = 2;  // shared register all pixels use
+// give stable x-coord references at 4/8/16-px hierarchy. Depth 1 has
+// no spare index, so it has no rulers.
+static Result<ScapResult> encode_scap_stripes_debug(const ScapSlotTable& table,
+                                                    std::size_t width,
+                                                    std::size_t height,
+                                                    std::size_t depth,
+                                                    std::size_t palette_size) {
+    const bool has_ruler = depth >= 2;
+    const std::size_t stripe_reg = has_ruler ? 2 : 1;  // shared register all pixels use
+    const std::size_t stripe_plane = has_ruler ? 1 : 0;
     constexpr std::uint16_t kBlack = 0x0000;
     constexpr int kVStart = 44;
 
-    // ---- Bitplane data: every pixel = index kStripeReg = 0b00010 -------
+    // ---- Bitplane data: every pixel = index stripe_reg ------------------
     auto enc = bitplane::BitplaneData{};
     auto aligned_w = (width + 15u) & ~std::size_t{15};
     enc.width = width;
     enc.height = height;
-    enc.depth = 6;
+    enc.depth = depth;
     enc.bytes_per_row = aligned_w / 8;
     enc.layout = bitplane::Layout::interleaved;
     enc.data.assign(enc.total_bytes(), 0);
-    // Set every byte of plane 1 (= bit value 2) to 0xFF → all pixels = idx 2
+    // Set every byte of the stripe plane to 0xFF → all pixels = stripe_reg
     for (std::size_t y = 0; y < height; ++y) {
-        auto off = enc.plane_row_offset(/*plane=*/1, y);
+        auto off = enc.plane_row_offset(stripe_plane, y);
         std::fill_n(enc.data.data() + off, enc.bytes_per_row, static_cast<std::uint8_t>(0xFF));
     }
     // Yellow rulers: paint ruler pixels with index 1 = 0b00001.
     // Clear plane 1 (drop idx 2), set plane 0 (add idx 1).
-    auto h_full = height;
-    auto h_half = height / 2;
-    auto h_quarter = height / 4;
+    auto h_full = has_ruler ? height : 0;
+    auto h_half = has_ruler ? height / 2 : 0;
+    auto h_quarter = has_ruler ? height / 4 : 0;
     auto set_bit = [&](std::size_t plane, std::size_t y, std::size_t x, bool on) {
         auto off = enc.plane_row_offset(plane, y);
         auto byte = x / 8;
@@ -1748,7 +1899,7 @@ static Result<ScapResult> encode_scap_ehb_debug(std::size_t width, std::size_t h
         else
             enc.data[off + byte] &= ~mask;
     };
-    for (std::size_t x = 0; x < width; ++x) {
+    for (std::size_t x = 0; x < width && has_ruler; ++x) {
         std::size_t marker_h = 0;
         if (x % 16 == 0)
             marker_h = h_full;
@@ -1764,10 +1915,10 @@ static Result<ScapResult> encode_scap_ehb_debug(std::size_t width, std::size_t h
         }
     }
 
-    // ---- Output palette (32 base entries) ----------------------------
-    std::vector<Color3f> palette(32, Color3f{0.0f, 0.0f, 0.0f});
-    palette[1] = Color3f{1.0f, 0.0f, 0.0f};  // red ruler
-    // palette[kStripeReg] = black (default 0x000); strips MOVEs change it.
+    // ---- Output palette (EHB: 32 base entries) ------------------------
+    std::vector<Color3f> palette(palette_size, Color3f{0.0f, 0.0f, 0.0f});
+    if (has_ruler) palette[1] = Color3f{1.0f, 0.0f, 0.0f};  // red ruler
+    // palette[stripe_reg] = black (default 0x000); strips MOVEs change it.
 
     // ---- Per-line copper: 1 reset MOVE + line-gate WAIT + 19 swaps ----
     std::vector<std::vector<ScapMove>> line_moves(height);
@@ -1776,7 +1927,7 @@ static Result<ScapResult> encode_scap_ehb_debug(std::size_t width, std::size_t h
         auto vp = static_cast<std::uint8_t>(abs_vpos & 0xFF);
         // Reset the shared register to black at top of each line (the
         // ONE per-line sliced MOVE we need; fits in hblank trivially).
-        line_moves[y].push_back(make_move(static_cast<std::uint8_t>(kStripeReg), kBlack, -1));
+        line_moves[y].push_back(make_move(static_cast<std::uint8_t>(stripe_reg), kBlack, -1));
         // Line-gate WAIT.
         line_moves[y].push_back(make_wait(static_cast<std::uint8_t>(table.line_gate_hpos), vp, -1));
         // 19 strips MOVEs: opposing primary/complement RGB pairs on the
@@ -1803,7 +1954,7 @@ static Result<ScapResult> encode_scap_ehb_debug(std::size_t width, std::size_t h
             }
             std::uint16_t v = (s % 2 == 0) ? color : complement;
             line_moves[y].push_back(
-                make_move(static_cast<std::uint8_t>(kStripeReg), v, static_cast<int>(s)));
+                make_move(static_cast<std::uint8_t>(stripe_reg), v, static_cast<int>(s)));
         }
         // End-of-line WAIT.
         line_moves[y].push_back(
@@ -1811,7 +1962,7 @@ static Result<ScapResult> encode_scap_ehb_debug(std::size_t width, std::size_t h
     }
 
     // Build a rendered preview matching what the planner expects: every
-    // pixel = palette[kStripeReg] except ruler markers = palette[1].
+    // pixel = palette[stripe_reg] except ruler markers = palette[1].
     Image preview(width, height);
     for (std::size_t yy = 0; yy < height; ++yy) {
         for (std::size_t x = 0; x < width; ++x) {
@@ -1945,7 +2096,7 @@ Result<ScapResult> encode_strips_ehb_ocs(
 
     auto width = (width_arg > 0) ? static_cast<std::size_t>(width_arg) : image.width();
     auto height = (height_arg > 0) ? static_cast<std::size_t>(height_arg) : image.height();
-    if (debug_overlay) return encode_scap_ehb_debug(width, height);
+    if (debug_overlay) return encode_scap_stripes_debug(table, width, height, 6, 32);
     if (image.width() != width || image.height() != height) {
         return std::unexpected{Error{
             ErrorCode::invalid_dimensions,

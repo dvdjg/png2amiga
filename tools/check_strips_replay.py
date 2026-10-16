@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay exported DPF/EHB/HAM6 bitplanes/COLOR writes and compare with the PNG preview.
+"""Replay exported DPF/EHB/HAM6/lores bitplanes/COLOR writes and compare with the PNG preview.
 
 Uses the established 320px OCS slot calibration, not a cycle-level emulator.
 Checks export/preview agreement and the fixed copper instruction budget.
@@ -15,6 +15,7 @@ from PIL import Image
 
 SLOTS = (0, 8, 23, 40, 55, 71, 88, 104, 120, 135,
          152, 168, 184, 200, 215, 232, 247, 263, 280, 295)
+LORES_SLOTS = (0,) + tuple(range(7, 304, 8))
 
 
 def words(text):
@@ -24,7 +25,8 @@ def words(text):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=('dpf', 'ehb', 'ham6'), default='dpf')
+    parser.add_argument('--mode', choices=('dpf', 'ehb', 'ham6', 'lores'), default='dpf')
+    parser.add_argument('--depth', type=int, choices=range(1, 5), default=3)
     parser.add_argument('--cli', required=True)
     parser.add_argument('--in', dest='source', required=True)
     parser.add_argument('--expect-black-border', action='store_true')
@@ -36,11 +38,17 @@ def main():
     is_ehb = args.mode == 'ehb'
     is_ham = args.mode == 'ham6'
     is_dpf = args.mode == 'dpf'
-    slots = tuple(range(7, 296, 16)) if is_ham else (tuple(range(9, 282, 16)) if is_ehb else SLOTS)
+    is_lores = args.mode == 'lores'
+    slots = {'ham6': tuple(range(7, 296, 16)), 'ehb': tuple(range(9, 282, 16)),
+             'dpf': SLOTS, 'lores': LORES_SLOTS}[args.mode]
+    gate_hpos, hblank_budget = {'dpf': (0x38, 14), 'lores': (0x3E, 13)}.get(args.mode, (0x3C, 13))
+    plane_count = args.depth if is_lores else 6
     with tempfile.TemporaryDirectory() as directory:
         header = Path(directory) / 'image.h'
         preview = Path(directory) / 'image.png'
-        mode_flags = ['--mode', args.mode] if not is_dpf else ['--mode', 'lores', '--dpf']
+        mode_flags = {'dpf': ['--mode', 'lores', '--dpf'],
+                      'lores': ['--mode', 'lores', '--depth', str(args.depth)]}.get(
+                          args.mode, ['--mode', args.mode])
         command = [args.cli, *mode_flags, '--strips',
                    '--width', '320', '--height', str(args.height), '--symbol', 'replay', *extra]
         for output in (header, preview):
@@ -51,11 +59,11 @@ def main():
             return words(re.search(r'\b' + name + r'\[.*?\]\s*=\s*\{(.*?)\};',
                                    text, re.S).group(1))
 
-        planes = [array(f'replay_plane{p}') for p in range(6)]
+        planes = [array(f'replay_plane{p}') for p in range(plane_count)]
         assert all(len(p) == 20 * args.height for p in planes), 'Unexpected bitplane dimensions'
         if is_dpf:
             assert not any(planes[0] + planes[2] + planes[4]), 'PF1 must remain empty'
-        registers = array('replay_palette') + [0] * 16
+        registers = (array('replay_palette') + [0] * 32)[:32]  # COLOR00..31
         copper = re.search(r'replay_strips_copper_list\[.*?\]\s*=\s*\{(.*?)\};',
                            text, re.S).group(1)
         rows = [words(line) for line in copper.splitlines() if '/* y=' in line]
@@ -65,8 +73,8 @@ def main():
             ops = list(zip(row[::2], row[1::2]))
             waits = [i for i, (address, _) in enumerate(ops) if address & 1]
             assert len(waits) == 2 and waits[-1] == len(ops) - 1
-            assert waits[0] <= (14 if is_dpf else 13), 'Hblank budget exceeded'
-            assert ops[waits[0]] == ((((44 + y) & 255) << 8) | (0x39 if is_dpf else 0x3D), 0xFFFE)
+            assert waits[0] <= hblank_budget, 'Hblank budget exceeded'
+            assert ops[waits[0]] == ((((44 + y) & 255) << 8) | gate_hpos | 1, 0xFFFE)
             expected_end = (((44 + y) & 255) << 8) | 0xE1
             if 44 + y == 255 and 44 + args.height > 256:
                 expected_end = max(expected_end, 0xFFDF)
@@ -104,6 +112,10 @@ def main():
                     else:
                         held = (held & 0xF0F) | (data << 4)
                     color = held
+                elif is_lores:
+                    index = sum(((planes[bit][word] >> shift) & 1) << bit
+                                for bit in range(plane_count))
+                    color = registers[index]
                 elif is_ehb:
                     index = sum(((planes[bit][word] >> shift) & 1) << bit for bit in range(6))
                     color = registers[index & 31]

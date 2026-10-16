@@ -1103,6 +1103,32 @@ sys.exit(0 if got==expect else (print(f'expected {expect}, got {got}') or 1))"
     set_tests_properties("smoke-ham6-strips-h-content"
                          PROPERTIES DEPENDS "smoke-ham6-strips-h")
 
+    # Plain lores + STRIPS (1-4 planes, 8-px slot grid): the .h carries the
+    # strips_lores_ocs copper list, one 39-MOVE chain per row.
+    add_test(
+        NAME "smoke-lores-strips-h"
+        COMMAND png2amiga --mode lores --depth 3 --sliced --slice-changes 7 --strips
+                --symbol lstrips ${PNG2AMIGA_TEST_INPUT}
+                ${CMAKE_BINARY_DIR}/lores-strips.h
+    )
+    add_test(
+        NAME "smoke-lores-strips-h-content"
+        COMMAND ${PNG2AMIGA_PYTHON} -c
+            "content = open('${CMAKE_BINARY_DIR}/lores-strips.h').read(); \
+            assert 'strips_lores_ocs (anchor=0x3E' in content, 'strips_lores_ocs label missing'; \
+            assert 'lstrips_strips_copper_list' in content, 'strips copper list missing'"
+    )
+    set_tests_properties("smoke-lores-strips-h-content"
+                         PROPERTIES DEPENDS "smoke-lores-strips-h")
+    # 5+ lores planes steal the copper's even cycles: no strips variant.
+    add_test(
+        NAME "strips-rejects-lores-depth5"
+        COMMAND png2amiga --mode lores --depth 5 --strips
+                ${PNG2AMIGA_TEST_INPUT}
+                ${CMAKE_BINARY_DIR}/strips-reject-d5.png
+    )
+    set_tests_properties("strips-rejects-lores-depth5" PROPERTIES WILL_FAIL TRUE)
+
     # --tile: pre-replicate input 3x3, run pipeline, crop centre. Verify
     # that the encoded .h has the requested centre dimensions (W x H,
     # NOT 3W x 3H), and that the same flag is rejected on a HAM mode.
@@ -2374,6 +2400,10 @@ sys.exit(0 if ok else 1)")
         COMMAND ${_equiv_chk}
             --in ${_pal_makena_in}
             -- --mode ehb --strips)
+    add_test(NAME "api-equiv-strips-lores"
+        COMMAND ${_equiv_chk}
+            --in ${_pal_makena_in}
+            -- --mode lores --depth 3 --sliced --slice-changes 7 --strips)
     # hires plain — main.cpp's std-lores path matches api once smoke
     # resolves the per-mode depth default (hires non-AGA → 4, lores → 5).
     add_test(NAME "api-equiv-hires-plain"
@@ -2929,6 +2959,31 @@ sys.exit(0 if ok else 1)")
         add_test(NAME "dpf-strips-replay-${_case}"
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py
                 --cli $<TARGET_FILE:png2amiga>
+                --in ${CMAKE_SOURCE_DIR}/examples/chuck31.png
+                ${_replay_options}
+                -- ${_replay_args})
+    endforeach()
+
+    # Plain lores strips, 1-4 planes on the 8-px grid (Copperline-calibrated).
+    foreach(_case IN ITEMS "d1" "d2" "d3" "d4" "budget" "early" "late" "tall" "no-lock")
+        set(_replay_args)
+        set(_replay_options --depth 3)
+        if(_case MATCHES "^d([1-4])$")
+            set(_replay_options --depth ${CMAKE_MATCH_1} --expect-black-border)
+        elseif(_case STREQUAL "budget")
+            set(_replay_args --slice-changes 7)
+        elseif(_case STREQUAL "early")
+            list(APPEND _replay_options --slot-shift -1)
+        elseif(_case STREQUAL "late")
+            list(APPEND _replay_options --slot-shift 1)
+        elseif(_case STREQUAL "tall")
+            list(APPEND _replay_options --height 249 --slot-shift 1)
+        elseif(_case STREQUAL "no-lock")
+            set(_replay_args --no-lock-color0)
+        endif()
+        add_test(NAME "lores-strips-replay-${_case}"
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py
+                --mode lores --cli $<TARGET_FILE:png2amiga>
                 --in ${CMAKE_SOURCE_DIR}/examples/chuck31.png
                 ${_replay_options}
                 -- ${_replay_args})

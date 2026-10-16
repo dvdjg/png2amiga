@@ -4304,20 +4304,22 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
     }
 
     // --- strips (mid-line palette swaps) ---
-    // Two variants:
-    //   * DPF: OCS lores DPF (depth=3), 8 PF2 colors. cpp export ready.
-    //   * EHB: OCS EHB (6bpp, 32 base + 32 hardware half-brites). No
-    //     cpp export wired yet — the encoder produces planes + preview.
+    // Variants (strips::kStripsVariants):
+    //   * lores: OCS lores 1-4 planes, 2-16 colors, 8-px slot grid.
+    //   * DPF: OCS lores DPF (depth=3), 8 PF2 colors.
+    //   * EHB: OCS EHB (6bpp, 32 base + 32 hardware half-brites).
+    //   * HAM6: OCS HAM6, 16 base colors.
     if (options.scap) {
         bool strips_ehb = mode == amiga::Mode::ehb;
         bool strips_dpf = options.dual_playfield && mode == amiga::Mode::lores;
         bool strips_ham6 = mode == amiga::Mode::ham6;
+        bool strips_lores = !options.dual_playfield && mode == amiga::Mode::lores && depth <= 4;
         if (chipset != amiga::Chipset::ocs || options.interlace ||
-            (!strips_ehb && !strips_dpf && !strips_ham6)) {
+            (!strips_ehb && !strips_dpf && !strips_ham6 && !strips_lores)) {
             return std::unexpected{Error{
                 ErrorCode::unsupported_mode,
-                "Strips requires OCS (no interlace) with --dpf lores depth=3, "
-                "--mode ehb, or --mode ham6",
+                "Strips requires OCS (no interlace) with --mode lores depth 1-4, "
+                "--dpf lores depth=3, --mode ehb, or --mode ham6",
             }};
         }
         if (has_transparency) {
@@ -4337,122 +4339,160 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         }
         std::span<const Color3f> strips_user_pal_span(strips_user_pal);
 
-        Result<strips::ScapResult> strips_res =
-            strips_ham6
-                ? strips::encode_strips_ham6_ocs(*image,
+        auto encode_strips = [&]() -> Result<strips::ScapResult> {
+            if (strips_ham6) {
+                return strips::encode_strips_ham6_ocs(
+                    *image,
+                    static_cast<int>(image->width()),
+                    static_cast<int>(image->height()),
+                    options.lock_color0,
+                    strips_dith,
+                    static_cast<std::size_t>(options.copper_changes),
+                    options.palette_diversity,
+                    options.on_progress,
+                    options.sliced_spread_radius,
+                    options.sliced_spread_decay,
+                    options.sliced_vertical_dither,
+                    options.best,
+                    strips_user_pal_span,
+                    (options.ham_metric == "srgb-mse") ? ham::HamMetric::srgb_mse
+                                                       : ham::HamMetric::oklab2);
+            }
+            if (strips_ehb) {
+                // strips-EHB reserves: build (idx, color) pairs for the
+                // 32-base palette. encode_strips_ehb_ocs forwards them to
+                // encode_copper as locked + dither-excluded, AND blocks
+                // the mid-line strips swap planner from targeting them.
+                std::vector<std::pair<std::size_t, Color3f>> strips_ehb_reserves;
+                for (auto& r : options.reserves) {
+                    auto i = static_cast<std::size_t>(r.index);
+                    if (r.index >= 0 && i < 32) {
+                        strips_ehb_reserves.emplace_back(
+                            i,
+                            palette_locks::to_color(
+                                LockSpec{r.index, r.r, r.g, r.b}, chipset, mode));
+                    }
+                }
+                return strips::encode_strips_ehb_ocs(
+                    *image,
+                    static_cast<int>(image->width()),
+                    static_cast<int>(image->height()),
+                    options.lock_color0,
+                    strips_dith,
+                    static_cast<std::size_t>(options.copper_changes),
+                    options.palette_diversity,
+                    options.strips_debug,
+                    options.on_progress,
+                    options.best,
+                    options.sliced_spread_radius,
+                    options.sliced_spread_decay,
+                    options.sliced_vertical_dither,
+                    strips_user_pal_span,
+                    strips_ehb_reserves,
+                    options.sliced_beam);
+            }
+            if (strips_lores) {
+                // strips-lores reserves/locks: palette index = COLOR
+                // register, no translation. Indices past 2^depth drop.
+                const std::size_t colors = std::size_t{1} << depth;
+                std::vector<std::pair<std::size_t, Color3f>> lores_reserves;
+                for (auto& r : options.reserves) {
+                    auto i = static_cast<std::size_t>(r.index);
+                    if (r.index >= 0 && i < colors) {
+                        lores_reserves.emplace_back(
+                            i,
+                            palette_locks::to_color(
+                                LockSpec{r.index, r.r, r.g, r.b}, chipset, mode));
+                    }
+                }
+                std::vector<std::pair<std::size_t, Color3f>> lores_locks;
+                for (auto& l : options.locks) {
+                    auto i = static_cast<std::size_t>(l.index);
+                    if (l.index >= 0 && i < colors)
+                        lores_locks.emplace_back(i, palette_locks::to_color(l, chipset, mode));
+                }
+                return strips::encode_strips_lores_ocs(
+                    *image,
+                    static_cast<int>(image->width()),
+                    static_cast<int>(image->height()),
+                    static_cast<int>(depth),
+                    options.lock_color0,
+                    strips_dith,
+                    options.strips_debug,
+                    static_cast<std::size_t>(options.copper_changes),
+                    options.palette_diversity,
+                    options.on_progress,
+                    options.best,
+                    options.sliced_spread_radius,
+                    options.sliced_spread_decay,
+                    options.sliced_vertical_dither,
+                    strips_user_pal_span,
+                    lores_reserves,
+                    lores_locks,
+                    options.sliced_beam);
+            }
+            // strips-DPF reserves/locks: indices reference the OCS
+            // DPF 16-entry CLUT layout (CLUT[0..7] = PF1, CLUT[8..15]
+            // = PF2). PF1 is zeroed in our encoder, so any CLUT-1..7
+            // entry is a silent no-op. PF2 base indices 0..7 map to
+            // CLUT registers via the OCS DPF combiner:
+            //   PF2 idx 0 → COLOR00 (dual-written to COLOR08 for
+            //               AGA-DPF source compatibility)
+            //   PF2 idx 1..7 → COLOR09..15
+            // Translate CLUT slot → PF2 base index for the planner.
+            auto translate_to_pf2 = [&](int user_idx) -> std::optional<int> {
+                if (user_idx < 0) return std::nullopt;
+                auto i = static_cast<std::size_t>(user_idx);
+                if (i == 0 || i == 8) return 0;
+                if (i >= 9 && i <= 15) return static_cast<int>(i - 8);
+                return std::nullopt;
+            };
+            std::vector<std::pair<std::size_t, Color3f>> strips_dpf_reserves;
+            strips_dpf_reserves.reserve(options.reserves.size());
+            for (auto& r : options.reserves) {
+                auto pf2 = translate_to_pf2(r.index);
+                if (!pf2) continue;
+                bool dup = std::any_of(
+                    strips_dpf_reserves.begin(), strips_dpf_reserves.end(), [&](const auto& p) {
+                        return static_cast<int>(p.first) == *pf2;
+                    });
+                if (dup) continue;
+                strips_dpf_reserves.emplace_back(
+                    static_cast<std::size_t>(*pf2),
+                    palette_locks::to_color(LockSpec{r.index, r.r, r.g, r.b}, chipset, mode));
+            }
+            std::vector<std::pair<std::size_t, Color3f>> strips_dpf_locks;
+            strips_dpf_locks.reserve(options.locks.size());
+            for (auto& l : options.locks) {
+                auto pf2 = translate_to_pf2(l.index);
+                if (!pf2) continue;
+                bool dup = std::any_of(
+                    strips_dpf_locks.begin(), strips_dpf_locks.end(), [&](const auto& p) {
+                        return static_cast<int>(p.first) == *pf2;
+                    });
+                if (dup) continue;
+                strips_dpf_locks.emplace_back(static_cast<std::size_t>(*pf2),
+                                              palette_locks::to_color(l, chipset, mode));
+            }
+            return strips::encode_strips_dpf_ocs(*image,
                                                  static_cast<int>(image->width()),
                                                  static_cast<int>(image->height()),
                                                  options.lock_color0,
                                                  strips_dith,
+                                                 options.strips_debug,
                                                  static_cast<std::size_t>(options.copper_changes),
                                                  options.palette_diversity,
                                                  options.on_progress,
+                                                 options.best,
                                                  options.sliced_spread_radius,
                                                  options.sliced_spread_decay,
                                                  options.sliced_vertical_dither,
-                                                 options.best,
                                                  strips_user_pal_span,
-                                                 (options.ham_metric == "srgb-mse")
-                                                     ? ham::HamMetric::srgb_mse
-                                                     : ham::HamMetric::oklab2)
-            : strips_ehb
-                ? [&] {
-                      // strips-EHB reserves: build (idx, color) pairs for the
-                      // 32-base palette. encode_strips_ehb_ocs forwards them to
-                      // encode_copper as locked + dither-excluded, AND blocks
-                      // the mid-line strips swap planner from targeting them.
-                      std::vector<std::pair<std::size_t, Color3f>> strips_ehb_reserves;
-                      for (auto& r : options.reserves) {
-                          auto i = static_cast<std::size_t>(r.index);
-                          if (r.index >= 0 && i < 32) {
-                              strips_ehb_reserves.emplace_back(
-                                  i,
-                                  palette_locks::to_color(
-                                      LockSpec{r.index, r.r, r.g, r.b}, chipset, mode));
-                          }
-                      }
-                      return strips::encode_strips_ehb_ocs(
-                          *image,
-                          static_cast<int>(image->width()),
-                          static_cast<int>(image->height()),
-                          options.lock_color0,
-                          strips_dith,
-                          static_cast<std::size_t>(options.copper_changes),
-                          options.palette_diversity,
-                          options.strips_debug,
-                          options.on_progress,
-                          options.best,
-                          options.sliced_spread_radius,
-                          options.sliced_spread_decay,
-                          options.sliced_vertical_dither,
-                          strips_user_pal_span,
-                          strips_ehb_reserves,
-                          options.sliced_beam);
-                  }()
-                : [&] {
-                      // strips-DPF reserves/locks: indices reference the OCS
-                      // DPF 16-entry CLUT layout (CLUT[0..7] = PF1, CLUT[8..15]
-                      // = PF2). PF1 is zeroed in our encoder, so any CLUT-1..7
-                      // entry is a silent no-op. PF2 base indices 0..7 map to
-                      // CLUT registers via the OCS DPF combiner:
-                      //   PF2 idx 0 → COLOR00 (dual-written to COLOR08 for
-                      //               AGA-DPF source compatibility)
-                      //   PF2 idx 1..7 → COLOR09..15
-                      // Translate CLUT slot → PF2 base index for the planner.
-                      auto translate_to_pf2 = [&](int user_idx) -> std::optional<int> {
-                          if (user_idx < 0) return std::nullopt;
-                          auto i = static_cast<std::size_t>(user_idx);
-                          if (i == 0 || i == 8) return 0;
-                          if (i >= 9 && i <= 15) return static_cast<int>(i - 8);
-                          return std::nullopt;
-                      };
-                      std::vector<std::pair<std::size_t, Color3f>> strips_dpf_reserves;
-                      strips_dpf_reserves.reserve(options.reserves.size());
-                      for (auto& r : options.reserves) {
-                          auto pf2 = translate_to_pf2(r.index);
-                          if (!pf2) continue;
-                          bool dup = std::any_of(
-                              strips_dpf_reserves.begin(),
-                              strips_dpf_reserves.end(),
-                              [&](const auto& p) { return static_cast<int>(p.first) == *pf2; });
-                          if (dup) continue;
-                          strips_dpf_reserves.emplace_back(
-                              static_cast<std::size_t>(*pf2),
-                              palette_locks::to_color(
-                                  LockSpec{r.index, r.r, r.g, r.b}, chipset, mode));
-                      }
-                      std::vector<std::pair<std::size_t, Color3f>> strips_dpf_locks;
-                      strips_dpf_locks.reserve(options.locks.size());
-                      for (auto& l : options.locks) {
-                          auto pf2 = translate_to_pf2(l.index);
-                          if (!pf2) continue;
-                          bool dup = std::any_of(
-                              strips_dpf_locks.begin(), strips_dpf_locks.end(), [&](const auto& p) {
-                                  return static_cast<int>(p.first) == *pf2;
-                              });
-                          if (dup) continue;
-                          strips_dpf_locks.emplace_back(static_cast<std::size_t>(*pf2),
-                                                        palette_locks::to_color(l, chipset, mode));
-                      }
-                      return strips::encode_strips_dpf_ocs(
-                          *image,
-                          static_cast<int>(image->width()),
-                          static_cast<int>(image->height()),
-                          options.lock_color0,
-                          strips_dith,
-                          options.strips_debug,
-                          static_cast<std::size_t>(options.copper_changes),
-                          options.palette_diversity,
-                          options.on_progress,
-                          options.best,
-                          options.sliced_spread_radius,
-                          options.sliced_spread_decay,
-                          options.sliced_vertical_dither,
-                          strips_user_pal_span,
-                          strips_dpf_reserves,
-                          strips_dpf_locks,
-                          options.sliced_beam);
-                  }();
+                                                 strips_dpf_reserves,
+                                                 strips_dpf_locks,
+                                                 options.sliced_beam);
+        };
+        Result<strips::ScapResult> strips_res = encode_strips();
         if (!strips_res) return std::unexpected{strips_res.error()};
 
         PipelineResult result;
@@ -6018,16 +6058,11 @@ ConvertResult convert_cheader(const std::uint8_t* input_data,
     // (data only — no init code; that lives in the .cpp viewer).
     if (result->scap && !result->strips_line_moves.empty()) {
         ch_opts.strips_line_moves = &result->strips_line_moves;
-        bool strips_ehb = result->mode == amiga::Mode::ehb;
-        bool strips_ham6 = result->mode == amiga::Mode::ham6;
-        auto& table = strips_ehb    ? strips::kStrips6bplEhb
-                      : strips_ham6 ? strips::kStrips6bplHam6
-                                    : strips::kStrips6bplOcs;
-        ch_opts.strips_label = strips_ehb    ? "strips_ehb_ocs"
-                               : strips_ham6 ? "strips_ham6_ocs"
-                                             : "strips_dpf_ocs";
-        ch_opts.strips_anchor_hpos = table.line_gate_hpos;
-        ch_opts.strips_total_planes = table.total_planes;
+        const auto* variant = strips::strips_variant_for(result->mode, result->dpf);
+        if (!variant) return make_error("Strips: no variant for this mode");
+        ch_opts.strips_label = std::string(variant->label);
+        ch_opts.strips_anchor_hpos = variant->table->line_gate_hpos;
+        ch_opts.strips_total_planes = variant->table->total_planes;
     }
     auto header = cheader::generate(result->planes, result->palette, result->mode, ch_opts);
     if (!header) return make_error(header.error().message);
@@ -6169,16 +6204,11 @@ ConvertResult convert_viewer(const std::uint8_t* input_data,
     }
     if (result->scap && !result->strips_line_moves.empty()) {
         ch_opts.strips_line_moves = &result->strips_line_moves;
-        bool strips_ehb = result->mode == amiga::Mode::ehb;
-        bool strips_ham6 = result->mode == amiga::Mode::ham6;
-        auto& table = strips_ehb    ? strips::kStrips6bplEhb
-                      : strips_ham6 ? strips::kStrips6bplHam6
-                                    : strips::kStrips6bplOcs;
-        ch_opts.strips_label = strips_ehb    ? "strips_ehb_ocs"
-                               : strips_ham6 ? "strips_ham6_ocs"
-                                             : "strips_dpf_ocs";
-        ch_opts.strips_anchor_hpos = table.line_gate_hpos;
-        ch_opts.strips_total_planes = table.total_planes;
+        const auto* variant = strips::strips_variant_for(result->mode, result->dpf);
+        if (!variant) return make_error("Strips: no variant for this mode");
+        ch_opts.strips_label = std::string(variant->label);
+        ch_opts.strips_anchor_hpos = variant->table->line_gate_hpos;
+        ch_opts.strips_total_planes = variant->table->total_planes;
         ch_opts.fade_in = false;  // strips carries its own per-line palette
     }
     auto viewer = cheader::generate_viewer(planes, result->palette, result->mode, ch_opts);

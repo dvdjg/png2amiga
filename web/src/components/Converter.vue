@@ -886,20 +886,19 @@ const dpfAvailable = computed(() => {
   return options.depth === 3 && !m.includes('hires')
 })
 
-// strips — mid-line palette swaps. Two flavours, both OCS lores only:
+// strips — mid-line palette swaps, OCS only:
+//   * lores (depth 1-4, no DPF): 2-16 base colors, 8-px slot grid.
 //   * DPF + lores (depth=3): 3-plane PF2, 8 base colors.
 //   * EHB (mode=ehb): 32 base + 32 hardware-derived half-brites.
 // strips is an extension to sliced (per-line palette evolution); enabling
 // strips turns sliced on too, and turning sliced off cascades strips off.
 const scapAvailable = computed(() => {
-  const cs = effectiveChipset(options.mode, options.chipset)
-  if (cs !== 'ocs') return false
-  // DPF lores at depth=3
-  if (options.dualPlayfield && options.mode === 'lores' &&
-      options.depth === 3) return true
+  if (effectiveChipset(options.mode, options.chipset) !== 'ocs') return false
   // EHB (depth is fixed at 6 for EHB; mode string identifies it)
   if (options.mode === 'ehb') return true
-  return false
+  if (options.mode !== 'lores') return false
+  // DPF lores at depth=3, plain lores at depth 1-4
+  return options.dualPlayfield ? options.depth === 3 : options.depth <= 4
 })
 
 // --best multi-restart sweep eligibility. Mirrors the C++ eligibility
@@ -1089,7 +1088,7 @@ watch(bestEligible, (eligible) => {
 })
 
 // Depth changes can invalidate DPF (requires depth=3 OCS / 4 AGA) and
-// strips (depth=3 OCS lores only). Mode/dpf watchers above don't fire
+// strips (OCS lores depth 1-4, DPF depth 3). Mode/dpf watchers above don't fire
 // when only the depth slider moves, so reset here too.
 watch(() => options.depth, () => {
   if (!dpfAvailable.value) options.dualPlayfield = false
@@ -2772,7 +2771,7 @@ async function loadExample(example: typeof EXAMPLES[number]) {
 
               <!-- strips — mid-line palette swaps (OCS lores only, DPF or EHB) -->
               <div v-if="scapAvailable" class="grid align-items-center">
-                <label class="col-4 text-xs text-color-secondary font-semibold" title="Strip palette: mid-line palette swaps inside the displayed area, on top of the sliced palette's per-line evolution. 19 MOVEs per scanline at 16-lores-px stride; slot HPOS table calibrated against real OCS hardware. Two flavours: DPF (3-plane PF2, 8 base colors) and EHB (32 base + 32 hardware-derived half-brites).">Strips</label>
+                <label class="col-4 text-xs text-color-secondary font-semibold" title="Strip palette: mid-line palette swaps inside the displayed area, on top of the sliced palette's per-line evolution. Lores 1-4 planes: 39 MOVEs per scanline at 8-px stride. DPF (3-plane PF2, 8 base colors) and EHB (32 base + 32 half-brites): 19 MOVEs at 16-px stride.">Strips</label>
                 <div class="col-8 flex align-items-center gap-2">
                   <ToggleSwitch v-model="options.scap" />
                   <span style="color: #888; font-size: 0.625rem;">mid-line swaps</span>
