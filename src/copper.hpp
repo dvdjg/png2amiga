@@ -289,7 +289,12 @@ Result<CopperResult> encode_copper(
     // where the heuristic still loses, --best
     // sweeps beam=off and beam=on and the
     // S2-ranked sweep picks per image.
-    bool sliced_beam = false);
+    bool sliced_beam = false,
+    // Non-EHB, <= 32 colours: refine the seed like plain lores and keep a
+    // swap only if the dithered rows around it improve (DitherWindow in
+    // copper.cpp). The DPF strips encoder passes false: its mid-line planner
+    // is tuned on the unchecked per-line palettes (ramps S2 41.6 -> 30.9).
+    bool dither_checked = true);
 
 // ---------------------------------------------------------------------------
 // Render a copper-palette image back to an Image for preview.

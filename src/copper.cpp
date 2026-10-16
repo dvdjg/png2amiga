@@ -627,7 +627,8 @@ Result<CopperResult> encode_copper(const Image& image,
                                    bool vertical_dither,
                                    const std::vector<std::size_t>& dither_excluded,
                                    std::optional<quantize::Algorithm> quantizer_override,
-                                   bool sliced_beam) {
+                                   bool sliced_beam,
+                                   bool dither_checked) {
     if (depth < 1 || depth > 8) {
         return std::unexpected{Error{
             ErrorCode::invalid_depth,
@@ -710,7 +711,8 @@ Result<CopperResult> encode_copper(const Image& image,
                                          vertical_dither,
                                          dither_excluded,
                                          /*quantizer_override=*/std::nullopt,
-                                         sliced_beam);
+                                         sliced_beam,
+                                         dither_checked);
             if (!stretch) return std::unexpected{stretch.error()};
             ++aga_speculatives_done;
             if (stretch->max_moves_per_line <= move_budget) {
@@ -745,7 +747,8 @@ Result<CopperResult> encode_copper(const Image& image,
                                          vertical_dither,
                                          dither_excluded,
                                          /*quantizer_override=*/std::nullopt,
-                                         sliced_beam);
+                                         sliced_beam,
+                                         dither_checked);
                 }
                 return stretch;
             }
@@ -861,7 +864,8 @@ Result<CopperResult> encode_copper(const Image& image,
         // unrefined seed has #111 instead and the black speckles red, S2 -6).
         // With no swaps the sliced output then equals plain lores. Reserve
         // slots are left to the existing path.
-        if (!is_ehb && num_colors <= kDitherCheckMaxColors && dither_excluded.empty()) {
+        if (dither_checked && !is_ehb && num_colors <= kDitherCheckMaxColors &&
+            dither_excluded.empty()) {
             constexpr std::size_t kRefineIterations = 8;  // plain's --refine default
             auto refined = quantize::refine_with_dither(image,
                                                         Palette{"refined", base_pal},
@@ -1221,7 +1225,8 @@ Result<CopperResult> encode_copper(const Image& image,
             };
             std::optional<DitherWindow> window;
             DitherWindow::Score cur_score{};
-            if (!is_ehb && num_colors <= kDitherCheckMaxColors && this_row_changes > 0) {
+            if (dither_checked && !is_ehb && num_colors <= kDitherCheckMaxColors &&
+                this_row_changes > 0) {
                 window.emplace(image, all_lab, dither_settings, y, is_lace, resolved_decay);
                 const auto& other_field = (is_lace && (y & 1)) ? current_pal_f1 : current_pal_f2;
                 for (std::size_t r = 0; r < window->rows(); ++r) {
