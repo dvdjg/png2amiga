@@ -9285,6 +9285,19 @@ int run_main(int argc, char* argv[]) {
 
         std::size_t skip_initial_lace = config->interlace ? 2 : 0;
 
+        // --palette seeds the sliced base palette (api.cpp does the same).
+        std::vector<Color3f> copper_user_pal;
+        if (!config->palette_file.empty()) {
+            auto loaded = palette_io::load_palette(config->palette_file);
+            if (!loaded) {
+                std::println(stderr, "Palette load error: {}", loaded.error().message);
+                return 1;
+            }
+            Palette user_pal = *std::move(loaded);
+            snap_palette(user_pal, chipset, config->mode);
+            copper_user_pal = std::move(user_pal.colors);
+        }
+
         // Single-pass encoder factored so best below can replay it
         // under a parallel jitter sweep without duplicating the args.
         auto encode_once = [&](const Image& img,
@@ -9298,7 +9311,7 @@ int run_main(int argc, char* argv[]) {
                 d,
                 chipset,
                 static_cast<std::size_t>(config->copper_changes),
-                nullptr,
+                copper_user_pal.empty() ? nullptr : &copper_user_pal,
                 config->lock_color0,
                 copper_locks,
                 diversity,

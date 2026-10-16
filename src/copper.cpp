@@ -5,15 +5,20 @@
 #include "oklab_simd.hpp"
 #include "palette.hpp"
 #include "palette_locks.hpp"
+#include "palette_pairs.hpp"
 #include "quantize.hpp"
 #include "quantize_metal.hpp"
 #include "types.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <limits>
+#include <optional>
+#include <span>
 #include <vector>
 
 namespace png2amiga::copper {
@@ -420,6 +425,184 @@ SwapCandidate find_best_swap_ehb(std::span<const color_space::OKLab> current_lab
     return best;
 }
 
+// Dithered-result check for lores sliced swaps. find_best_swap scores a swap
+// by nearest-colour error of the slot's own cluster, which cannot see that
+// the ditherer mixes a flat area from two or more entries: the second entry
+// owns few nearest pixels, looks free, and gets taken. The area then mixes
+// with a far colour (red speckle in 0256's black, a light dot band in 0386's
+// sky) while the planner's nearest-colour error goes down.
+//
+// This window runs the real sliced picker (diffuse_raw_buffer +
+// pick_palette_index_with_ostro, as pass 2) over rows y-kWarm .. y+kAhead.
+// Rows above y keep the palettes already planned, so error arrives at row
+// y as it does in the output. Rows from y on use the trial palette, since a
+// swap stays in effect until a later row changes the slot again. Interlace:
+// rows of the other field use that field's current palette.
+//
+// score() returns two terms over rows y.. (weighted decay^(row-y)):
+//   blurred  error of the result against the source after a horizontal box
+//            (half-widths 1, 3, 7) and a vertical [1 2 1] filter, summed
+//            over the three scales: what the eye averages the dither into.
+//   raw      per-pixel error, the dither noise.
+// A swap is kept only if blurred drops and raw does not rise. Blurred alone
+// accepts trades of a small mean shift for new noise in flat areas (0718's
+// dark background: B-channel noise for a 2/255 mean gain, S2 -7).
+//
+// Applied (with the refined seed below) up to 32 colours. Each trial is a
+// window dither whose cost grows with the palette; at lores d8 AGA a frame
+// took 45-60 s instead of 3 s, and the old planner already scores above plain
+// there (0779: 84.8 vs 82.5).
+constexpr std::size_t kDitherCheckMaxColors = 32;
+
+class DitherWindow {
+public:
+    static constexpr std::size_t kWarm = 4;
+    static constexpr std::size_t kAhead = 8;
+
+    struct Score {
+        double blurred{};
+        double raw{};
+    };
+
+    DitherWindow(const Image& image,
+                 const std::vector<std::vector<color_space::OKLab>>& all_lab,
+                 const dither::Settings& settings,
+                 std::size_t y,
+                 bool is_lace,
+                 float decay)
+        : all_lab_(all_lab), settings_(settings), width_(image.width()), y_(y), lace_(is_lace) {
+        auto height = image.height();
+        y0_ = (!is_lace && y >= kWarm) ? y - kWarm
+                                       : (is_lace && y >= 2 * kWarm ? y - 2 * kWarm : 0);
+        auto y1 = std::min(height - 1, y + kAhead);
+        rows_ = y1 - y0_ + 1;
+        std::vector<Color3f> px(width_ * rows_);
+        for (std::size_t r = 0; r < rows_; ++r) {
+            auto src = image.row(y0_ + r);
+            std::copy(src.begin(), src.end(), px.begin() + static_cast<std::ptrdiff_t>(r * width_));
+        }
+        win_ = Image(width_, rows_, std::move(px));
+        row_w_.resize(rows_);
+        for (std::size_t r = 0; r < rows_; ++r) {
+            auto gy = y0_ + r;
+            row_w_[r] = gy < y ? 0.0f : std::pow(decay, static_cast<float>(gy - y));
+        }
+        fixed_.resize(rows_);
+        err_.resize(width_ * rows_);
+        box_.resize(width_ * rows_);
+    }
+
+    // Palette (usable entries only, OKLab) for window row r when that row is
+    // not driven by the trial palette: a row above y, or the other field.
+    void set_fixed(std::size_t r, std::vector<color_space::OKLab> lab) {
+        fixed_[r] = std::move(lab);
+    }
+    std::size_t rows() const { return rows_; }
+    std::size_t row_y(std::size_t r) const { return y0_ + r; }
+    bool uses_trial(std::size_t r) const {
+        auto gy = y0_ + r;
+        return gy >= y_ && (!lace_ || ((gy ^ y_) & 1) == 0);
+    }
+
+    Score score(std::span<const color_space::OKLab> trial) {
+        dither::diffuse_raw_buffer(
+            win_,
+            settings_,
+            [&](const color_space::OKLab& target,
+                std::size_t x,
+                std::size_t r) -> dither::PickResult {
+                std::span<const color_space::OKLab> pal = uses_trial(r)
+                                                              ? trial
+                                                              : std::span<const color_space::OKLab>(
+                                                                    fixed_[r]);
+                std::size_t k = 0;
+                color_space::OKLab chosen{};
+                float thr = dither::pick_palette_index_with_ostro(settings_.method,
+                                                                  target,
+                                                                  pal,
+                                                                  x,
+                                                                  y0_ + r,
+                                                                  settings_.strength,
+                                                                  /*k_min=*/0,
+                                                                  k,
+                                                                  chosen);
+                const auto& s = all_lab_[y0_ + r][x];
+                err_[r * width_ + x] = {chosen.L - s.L, chosen.a - s.a, chosen.b - s.b};
+                return {chosen, thr};
+            });
+
+        Score sc;
+        for (std::size_t r = 0; r < rows_; ++r) {
+            if (row_w_[r] == 0.0f) continue;
+            double acc = 0.0;
+            for (std::size_t x = 0; x < width_; ++x) {
+                const auto& e = err_[r * width_ + x];
+                acc += static_cast<double>(color_space::fma_dist_sq(e.L, e.a, e.b));
+            }
+            sc.raw += static_cast<double>(row_w_[r]) * acc;
+        }
+        std::vector<double> pL(width_ + 1), pa(width_ + 1), pb(width_ + 1);
+        for (std::size_t hw : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
+            for (std::size_t r = 0; r < rows_; ++r) {
+                pL[0] = pa[0] = pb[0] = 0.0;
+                for (std::size_t x = 0; x < width_; ++x) {
+                    const auto& e = err_[r * width_ + x];
+                    pL[x + 1] = pL[x] + static_cast<double>(e.L);
+                    pa[x + 1] = pa[x] + static_cast<double>(e.a);
+                    pb[x + 1] = pb[x] + static_cast<double>(e.b);
+                }
+                for (std::size_t x = 0; x < width_; ++x) {
+                    auto x0 = x >= hw ? x - hw : 0;
+                    auto x1 = std::min(width_, x + hw + 1);
+                    auto n = static_cast<double>(x1 - x0);
+                    box_[r * width_ + x] = {static_cast<float>((pL[x1] - pL[x0]) / n),
+                                            static_cast<float>((pa[x1] - pa[x0]) / n),
+                                            static_cast<float>((pb[x1] - pb[x0]) / n)};
+                }
+            }
+            for (std::size_t r = 0; r < rows_; ++r) {
+                if (row_w_[r] == 0.0f) continue;
+                double acc = 0.0;
+                for (std::size_t x = 0; x < width_; ++x) {
+                    const auto& c = box_[r * width_ + x];
+                    float L = 2.0f * c.L, a = 2.0f * c.a, b = 2.0f * c.b, tw = 2.0f;
+                    if (r > 0) {
+                        const auto& u = box_[(r - 1) * width_ + x];
+                        L += u.L;
+                        a += u.a;
+                        b += u.b;
+                        tw += 1.0f;
+                    }
+                    if (r + 1 < rows_) {
+                        const auto& d = box_[(r + 1) * width_ + x];
+                        L += d.L;
+                        a += d.a;
+                        b += d.b;
+                        tw += 1.0f;
+                    }
+                    acc += static_cast<double>(color_space::fma_dist_sq(L / tw, a / tw, b / tw));
+                }
+                sc.blurred += static_cast<double>(row_w_[r]) * acc;
+            }
+        }
+        return sc;
+    }
+
+private:
+    const std::vector<std::vector<color_space::OKLab>>& all_lab_;
+    const dither::Settings& settings_;
+    std::size_t width_;
+    std::size_t y_;
+    bool lace_;
+    std::size_t y0_{};
+    std::size_t rows_{};
+    Image win_;
+    std::vector<float> row_w_;
+    std::vector<std::vector<color_space::OKLab>> fixed_;
+    std::vector<color_space::OKLab> err_;
+    std::vector<color_space::OKLab> box_;
+};
+
 }  // namespace
 
 // ===========================================================================
@@ -668,6 +851,42 @@ Result<CopperResult> encode_copper(const Image& image,
         // holds; an in-order fill duplicated it at slot 1 and dropped the
         // brightest colour (DIV2K 0041: S2 56 -> 27).
         palette_locks::fill_unlocked_slots(base_pal, base_locked, pr->colors);
+
+        // Give the seed the same dither-aware refinement the plain lores
+        // palette gets (main.cpp / api.cpp: refine_with_dither, joint_refit,
+        // pair refine). The planner below only moves a slot toward the
+        // nearest-colour centroid of pixels it already owns, so it cannot
+        // find mixing partners a cluster centroid never lands on (DIV2K
+        // 0256: plain's #010 next to #100 dithers the brown-black evenly; the
+        // unrefined seed has #111 instead and the black speckles red, S2 -6).
+        // With no swaps the sliced output then equals plain lores. Reserve
+        // slots are left to the existing path.
+        if (!is_ehb && num_colors <= kDitherCheckMaxColors && dither_excluded.empty()) {
+            constexpr std::size_t kRefineIterations = 8;  // plain's --refine default
+            auto refined = quantize::refine_with_dither(image,
+                                                        Palette{"refined", base_pal},
+                                                        dither_settings,
+                                                        chipset,
+                                                        amiga::Mode::lores,
+                                                        kRefineIterations,
+                                                        base_locked);
+            if (refined && refined->colors.size() == num_colors)
+                base_pal = std::move(refined->colors);
+            auto seed_dither = dither::apply(
+                image, std::span<const Color3f>(base_pal), dither_settings);
+            palette_pairs::joint_refit(image,
+                                       base_pal,
+                                       seed_dither,
+                                       base_locked,
+                                       chipset == amiga::Chipset::aga,
+                                       /*ehb=*/false,
+                                       [&](const std::vector<Color3f>& p) {
+                                           return dither::apply(
+                                               image, std::span<const Color3f>(p), dither_settings);
+                                       });
+            palette_pairs::refine(
+                image, base_pal, seed_dither, dither_settings, base_locked, chipset);
+        }
     }
 
     // Step 2: Iterative two-pass predict+dither loop.
@@ -944,7 +1163,133 @@ Result<CopperResult> encode_copper(const Image& image,
             auto this_row_changes = (y < skip_initial_swap_rows) ? std::size_t{0}
                                                                  : changes_per_line;
 
-            for (std::size_t s = 0; s < this_row_changes; ++s) {
+            // Applies one register write for this row. EHB also refreshes the
+            // half-brite mirror slot (k+32): pixels can migrate in or out of
+            // either cluster.
+            auto apply_change = [&](std::size_t slot, Color3f color) {
+                // Nibble-skip optimization (AGA only): if the new color shares
+                // its high 4-bit nibble with the slot's previous value, the
+                // LOCT=0 (high) write is unnecessary. The viewer detects
+                // skip_hi via a 0xFFFF sentinel in the hi-table reg field.
+                bool skip_hi_flag = false;
+                bool skip_lo_flag = false;
+                if (chipset == amiga::Chipset::aga) {
+                    auto old_hilo = palette::linear_to_aga_hilo(current_pal[slot]);
+                    auto new_hilo = palette::linear_to_aga_hilo(color);
+                    skip_hi_flag = (old_hilo.hi == new_hilo.hi);
+                    skip_lo_flag = (old_hilo.lo == new_hilo.lo);
+                }
+                swapped[slot] = true;
+                current_pal[slot] = color;
+                pal_lab[slot] = color_space::linear_to_oklab(color);
+                if (is_ehb) {
+                    pal_lab[num_colors + slot] = color_space::linear_to_oklab(
+                        palette::half_brite(color));
+                }
+                refresh_swap_scratch(sc,
+                                     pal_lab,
+                                     rows_lab,
+                                     width,
+                                     static_cast<std::uint8_t>(slot),
+                                     planner_excluded);
+                if (is_ehb) {
+                    refresh_swap_scratch(sc,
+                                         pal_lab,
+                                         rows_lab,
+                                         width,
+                                         static_cast<std::uint8_t>(num_colors + slot),
+                                         planner_excluded);
+                }
+                changes.push_back(CopperChange{
+                    static_cast<std::uint8_t>(slot),
+                    color,
+                    skip_hi_flag,
+                    skip_lo_flag,
+                });
+            };
+
+            // Non-EHB: every write must improve the dithered result in the
+            // window below (see DitherWindow). EHB keeps its own planner.
+            auto usable_lab = [&](const std::vector<Color3f>& pal) {
+                std::vector<color_space::OKLab> lab;
+                lab.reserve(num_colors);
+                for (std::size_t k = 0; k < num_colors; ++k) {
+                    if (!excluded_mask.empty() && excluded_mask[k]) continue;
+                    lab.push_back(color_space::linear_to_oklab(pal[k]));
+                }
+                return lab;
+            };
+            std::optional<DitherWindow> window;
+            DitherWindow::Score cur_score{};
+            if (!is_ehb && num_colors <= kDitherCheckMaxColors && this_row_changes > 0) {
+                window.emplace(image, all_lab, dither_settings, y, is_lace, resolved_decay);
+                const auto& other_field = (is_lace && (y & 1)) ? current_pal_f1 : current_pal_f2;
+                for (std::size_t r = 0; r < window->rows(); ++r) {
+                    if (window->uses_trial(r)) continue;
+                    auto gy = window->row_y(r);
+                    window->set_fixed(r, usable_lab(gy < y ? scanline_palettes[gy] : other_field));
+                }
+                cur_score = window->score(usable_lab(current_pal));
+            }
+            auto improves_dither = [&](std::size_t slot, Color3f color) {
+                if (!window) return true;
+                auto trial = current_pal;
+                trial[slot] = color;
+                auto s = window->score(usable_lab(trial));
+                if (s.blurred >= cur_score.blurred || s.raw > cur_score.raw) return false;
+                cur_score = s;
+                return true;
+            };
+
+            // Seed return. Centroid proposals only follow pixels a slot
+            // already owns, so a seed colour moved away on some rows never
+            // comes back once those rows end (0386: slot 25 holds the sky's
+            // #8AD in the seed and #999 at row 84; the sky there dithered
+            // #79C with light greys into a band of dots). Offer each moved
+            // slot its seed
+            // colour first, ranked by the nearest-colour gain with pixels
+            // re-assigned (the cluster-local score cannot see pixels moving
+            // in from other slots), and keep it if the dither improves.
+            if (window) {
+                std::vector<std::pair<double, std::size_t>> returns;
+                for (std::size_t k = 0; k < num_colors; ++k) {
+                    if (swapped[k] || current_pal[k] == base_pal[k]) continue;
+                    if (!excluded_mask.empty() && excluded_mask[k]) continue;
+                    auto seed_lab = color_space::linear_to_oklab(base_pal[k]);
+                    double gain = 0.0;
+                    for (std::size_t r = 0; r < rows_lab.size(); ++r) {
+                        const auto& rl = rows_lab[r];
+                        for (std::size_t x = 0; x < width; ++x) {
+                            auto i = r * width + x;
+                            const auto& p = rl[x];
+                            float d = color_space::fma_dist_sq(
+                                p.L - seed_lab.L, p.a - seed_lab.a, p.b - seed_lab.b);
+                            if (sc.assignments[i] == k) {
+                                for (std::size_t j = 0; j < num_colors; ++j) {
+                                    if (j == k) continue;
+                                    if (!excluded_mask.empty() && excluded_mask[j]) continue;
+                                    const auto& e = pal_lab[j];
+                                    d = std::min(
+                                        d,
+                                        color_space::fma_dist_sq(p.L - e.L, p.a - e.a, p.b - e.b));
+                                }
+                            } else {
+                                d = std::min(d, sc.best_dist[i]);
+                            }
+                            gain += static_cast<double>(sc.best_dist[i] - d) *
+                                    static_cast<double>(sc.pixel_weights[i]);
+                        }
+                    }
+                    if (gain > 0.0) returns.emplace_back(gain, k);
+                }
+                std::sort(returns.begin(), returns.end(), std::greater<>{});
+                for (auto [gain, k] : returns) {
+                    if (changes.size() >= this_row_changes) break;
+                    if (improves_dither(k, base_pal[k])) apply_change(k, base_pal[k]);
+                }
+            }
+
+            while (changes.size() < this_row_changes) {
                 SwapCandidate swap{0, {}, -1.0f};
                 if (is_ehb) {
                     swap = find_best_swap_ehb(
@@ -976,57 +1321,31 @@ Result<CopperResult> encode_copper(const Image& image,
                 // banding (chuck31: black-space pixels rendering as #444433
                 // because slot 1 had drifted from base #111 to #444).
                 // The cap keeps each slot perceptually within ΔE ~12 of base.
+                // A capped slot is skipped, not the rest of the row: ending
+                // the row here left fantasy1.jpg's later swaps unplanned.
                 constexpr float kMaxDriftSq = 0.03f;
                 auto base_lab = color_space::linear_to_oklab(base_pal[swap.slot]);
                 auto new_lab = color_space::linear_to_oklab(swap.new_color);
                 float ddL = base_lab.L - new_lab.L;
                 float dda = base_lab.a - new_lab.a;
                 float ddb = base_lab.b - new_lab.b;
-                if (color_space::fma_dist_sq(ddL, dda, ddb) > kMaxDriftSq) break;
-
-                // Nibble-skip optimization (AGA only): if the new color shares its
-                // high 4-bit nibble with the slot's previous value, the LOCT=0 (high)
-                // write is unnecessary. The viewer detects skip_hi via a 0xFFFF
-                // sentinel in the hi-table reg field.
-                bool skip_hi_flag = false;
-                bool skip_lo_flag = false;
-                if (chipset == amiga::Chipset::aga) {
-                    auto old_hilo = palette::linear_to_aga_hilo(current_pal[swap.slot]);
-                    auto new_hilo = palette::linear_to_aga_hilo(swap.new_color);
-                    skip_hi_flag = (old_hilo.hi == new_hilo.hi);
-                    skip_lo_flag = (old_hilo.lo == new_hilo.lo);
+                if (color_space::fma_dist_sq(ddL, dda, ddb) > kMaxDriftSq) {
+                    if (is_ehb) break;
+                    swapped[swap.slot] = true;
+                    continue;
                 }
-
-                // Apply the swap. For EHB, also update the half-brite mirror
-                // slot (k+32) and refresh the scratch for both — pixels can
-                // migrate in or out of either cluster as a result.
-                swapped[swap.slot] = true;
-                current_pal[swap.slot] = swap.new_color;
-                pal_lab[swap.slot] = color_space::linear_to_oklab(swap.new_color);
-                if (is_ehb) {
-                    pal_lab[num_colors + swap.slot] = color_space::linear_to_oklab(
-                        palette::half_brite(swap.new_color));
+                // A rejected swap holds the slot for this row. A centroid
+                // that snaps back onto the slot's current colour changes
+                // nothing and is rejected without a trial dither.
+                if (window && swap.new_color == current_pal[swap.slot]) {
+                    swapped[swap.slot] = true;
+                    continue;
                 }
-                refresh_swap_scratch(sc,
-                                     pal_lab,
-                                     rows_lab,
-                                     width,
-                                     static_cast<std::uint8_t>(swap.slot),
-                                     planner_excluded);
-                if (is_ehb) {
-                    refresh_swap_scratch(sc,
-                                         pal_lab,
-                                         rows_lab,
-                                         width,
-                                         static_cast<std::uint8_t>(num_colors + swap.slot),
-                                         planner_excluded);
+                if (!improves_dither(swap.slot, swap.new_color)) {
+                    swapped[swap.slot] = true;
+                    continue;
                 }
-                changes.push_back(CopperChange{
-                    static_cast<std::uint8_t>(swap.slot),
-                    swap.new_color,
-                    skip_hi_flag,
-                    skip_lo_flag,
-                });
+                apply_change(swap.slot, swap.new_color);
             }
 
             // ---- PHASE B: forward-look beam fill (PNG2AMIGA_SLICED_BEAM=1) ----
