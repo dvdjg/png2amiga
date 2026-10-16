@@ -39,7 +39,9 @@ const BUDGETS = [
   // 3.00 MB up from 2.85 MB — joint palette refit across every
   // chosen-palette mode and the dither-checked sliced planner bring the
   // SIMD release build to 2.94 MB.
-  { match: /^png2amiga-.*\.wasm$/,  max:   3.00 * 1024 * 1024, label: 'wasm binary' },
+  // 3.25 MB up from 3.00 MB — the resumable per-row diffuser and batched
+  // parallel sliced-planner trials bring the SIMD release build to 3.05 MB.
+  { match: /^png2amiga-.*\.wasm$/,  max:   3.25 * 1024 * 1024, label: 'wasm binary' },
   { match: /^wasm\.worker-.*\.js$/, max:  20 * 1024, label: 'worker'     },
   { match: /^crt-.*\.js$/,          max:  30 * 1024, label: 'crt module' },
   { match: /^index-.*\.css$/,       max: 500 * 1024, label: 'css'        },
