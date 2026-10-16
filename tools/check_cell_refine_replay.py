@@ -38,10 +38,11 @@ with tempfile.TemporaryDirectory() as folder:
     decoded = np.empty_like(preview)
     if a.mode in ('thomson-to7-320x16', 'thomson-to8-320x16'):
         assert (w, h) == (320, 200) and len(data) == 16000
-        intens = [0, 96, 124, 143, 159, 172, 183, 194, 203, 212, 220, 228, 235, 242, 248, 255]
-        idx = [(0,0,0),(15,0,0),(0,15,0),(15,15,0),(0,0,15),(15,0,15),(0,15,15),(15,15,15),
-               (7,7,7),(10,3,3),(3,10,3),(10,10,3),(3,3,10),(10,3,10),(7,14,14),(11,7,0)]
-        pal = meta['palette'] if a.mode == 'thomson-to8-320x16' else [[intens[c] for c in rgb] for rgb in idx]
+        to7 = palette_source.split('kThomsonTo770Rgb = {', 1)[1].split('};', 1)[0]
+        to7 = [int(v, 16) for v in re.findall(r'0x([0-9a-fA-F]{6})', to7)]
+        assert len(to7) == 16
+        pal = meta['palette'] if a.mode == 'thomson-to8-320x16' else \
+            [[(c >> 16) & 255, (c >> 8) & 255, c & 255] for c in to7]
         for cell in range(8000):
             attr, mask = data[cell], data[cell + 8000]
             bg = (attr & 7) | (((~attr) >> 4) & 8)
