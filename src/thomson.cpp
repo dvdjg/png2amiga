@@ -515,7 +515,8 @@ Result<EncodeResult> encode(const Image& image,
     }
     if (amiga::is_thomson_bitmap(mode)) {
         std::size_t n = amiga::thomson_palette_size(mode);
-        auto pal = quantize_to8(image, n);
+        auto pal = (to8_palette && to8_palette->size() == n) ? *to8_palette
+                                                             : quantize_to8(image, n);
         return encode_bitmap(image, mode, pal, settings);
     }
     return std::unexpected{Error{ErrorCode::unsupported_mode, "thomson::encode: not a Thomson mode"}};

@@ -1,6 +1,7 @@
 #include "cpc.hpp"
 #include "color_space.hpp"
 #include "palette.hpp"
+#include "palette_pairs.hpp"
 #include "pipeline.hpp"
 #include "quantize.hpp"
 #include "scale.hpp"
@@ -33,6 +34,22 @@ constexpr std::array<ModeLayout, 3> kLayouts = {{
 constexpr std::size_t line_offset(std::size_t y) noexcept {
     return (y / 8) * kBytesPerLine + (y % 8) * 2048;
 }
+
+// Firmware gamut as a palette_pairs grid: each channel snaps to the
+// nearest of kLevels in sRGB.
+int firmware_level(float linear) {
+    const float s = std::clamp(color_space::linear_to_srgb(linear), 0.0f, 1.0f) * 255.0f;
+    return s < 64.0f ? 0 : s < 191.5f ? 1 : 2;
+}
+Color3f snap_firmware(Color3f c) {
+    return color_space::srgb_u8_to_linear(kLevels[static_cast<std::size_t>(firmware_level(c.r))],
+                                          kLevels[static_cast<std::size_t>(firmware_level(c.g))],
+                                          kLevels[static_cast<std::size_t>(firmware_level(c.b))]);
+}
+int code_firmware(Color3f c) {
+    return firmware_level(c.r) * 9 + firmware_level(c.g) * 3 + firmware_level(c.b);
+}
+constexpr palette_pairs::Grid kFirmwareGrid{snap_firmware, code_firmware};
 
 std::array<Color3f, 27> firmware_gamut() {
     std::array<Color3f, 27> g{};
@@ -282,6 +299,14 @@ Result<EncodeResult> encode(const Image& image,
         inks.push_back(inks.empty() ? Color3f{0, 0, 0} : inks.front());
 
     auto dres = dither::apply(image, inks, settings);
+    {
+        auto encode = [&](const std::vector<Color3f>& p) {
+            return dither::apply(image, std::span<const Color3f>(p), settings);
+        };
+        const auto& grid = plus ? palette_pairs::kOcs : kFirmwareGrid;
+        palette_pairs::joint_refit(image, inks, dres, {}, grid, false, encode);
+        palette_pairs::refine_with(image, inks, dres, {}, grid, encode);
+    }
 
     EncodeResult res;
     const int smode = amiga::cpc_screen_mode(mode);

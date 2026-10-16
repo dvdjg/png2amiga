@@ -3,6 +3,60 @@
 #include "thomson.hpp"
 
 namespace png2amiga::thomson {
+// TO8 palette fitting shared by every programmable mode: joint_refit, and for
+// the bitmap modes palette_pairs::refine_with, each trial a complete native
+// encode. Indices are read back from the rendered preview.
+inline EncodeResult fit_palette(const Image& source,
+                                EncodeResult seed,
+                                amiga::Mode mode,
+                                const dither::Settings& settings,
+                                bool cells) {
+    if (seed.palette.size() < 2) return seed;
+    auto linear = [](const std::vector<PaletteEntry>& entries) {
+        std::vector<Color3f> out;
+        for (auto e : entries)
+            out.push_back(color_space::srgb_hex_to_linear(palette::thomson_rgb_hex(e.r, e.g, e.b)));
+        return out;
+    };
+    auto indices_of = [&](const EncodeResult& r, const std::vector<Color3f>& pal) {
+        dither::DitherResult d;
+        d.indices.resize(r.rendered.pixels().size());
+        for (std::size_t i = 0; i < d.indices.size(); ++i) {
+            const auto px = r.rendered.pixels()[i];
+            std::size_t k = 0;
+            while (k + 1 < pal.size() && !(pal[k] == px))
+                ++k;
+            d.indices[i] = static_cast<std::uint8_t>(k);
+        }
+        return d;
+    };
+    std::vector<std::pair<std::vector<int>, EncodeResult>> trials;
+    auto encode = [&](const std::vector<Color3f>& pal) {
+        std::vector<PaletteEntry> entries;
+        for (auto c : pal) {
+            const auto code = palette_pairs::thomson_code(c);
+            entries.push_back({static_cast<std::uint8_t>(code >> 8),
+                               static_cast<std::uint8_t>((code >> 4) & 15),
+                               static_cast<std::uint8_t>(code & 15)});
+        }
+        auto r = thomson::encode(source, mode, settings, {}, &entries, cells);
+        if (!r) return dither::DitherResult{};
+        auto d = indices_of(*r, pal);
+        trials.emplace_back(palette_pairs::key(pal, palette_pairs::kThomson), std::move(*r));
+        return d;
+    };
+    auto colors = linear(seed.palette);
+    const auto seed_key = palette_pairs::key(colors, palette_pairs::kThomson);
+    auto output = indices_of(seed, colors);
+    palette_pairs::joint_refit(source, colors, output, {}, palette_pairs::kThomson, false, encode);
+    if (amiga::is_thomson_bitmap(mode))
+        palette_pairs::refine_with(source, colors, output, {}, palette_pairs::kThomson, encode);
+    const auto key = palette_pairs::key(colors, palette_pairs::kThomson);
+    if (key == seed_key) return seed;
+    for (auto& [k, r] : trials)
+        if (k == key) return std::move(r);
+    return seed;
+}
 // TO8 forme-couleur palette fitting. Every trial is a complete native encode,
 // so its two-color cells, dither and optional cell refinement stay legal.
 inline EncodeResult refine_palette(const Image& source,
@@ -51,8 +105,8 @@ inline EncodeResult refine_palette(const Image& source,
             for (bool lab : {false, true}) {
                 int added = 0;
                 for (auto& p :
-                     palette_pairs::proposals(source, frame, {}, lab, false, false, paired, true)) {
-                    if (!seen.insert(palette_pairs::key(p.palette, false, true)).second) continue;
+                     palette_pairs::proposals(source, frame, {}, lab, palette_pairs::kThomson, false, paired)) {
+                    if (!seen.insert(palette_pairs::key(p.palette, palette_pairs::kThomson)).second) continue;
                     candidates.push_back(std::move(p));
                     if (++added == 4) break;
                 }

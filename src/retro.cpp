@@ -1,6 +1,7 @@
 #include "retro.hpp"
 #include "atari/spectrum_runtime.hpp"
 #include "palette.hpp"
+#include "palette_locks.hpp"
 #include "quantize.hpp"
 #include "pipeline.hpp"
 #include <array>
@@ -118,12 +119,18 @@ EncodeResult spectrum(const Image& image, bool ste, const dither::Settings& sett
             row[x, 0] = image[x, y];
             target[x] = color_space::linear_to_oklab(image[x, y]);
         }
-        auto seed = quantize::quantize(row, 14);
-        for (std::size_t k = 0; k < 48; ++k) {
-            colors[y][k] = (k % 16 == 0 || k % 16 == 15)
-                               ? Color3f{}
-                               : snap(seed->colors[(k % 16 - 1) % seed->colors.size()], ste);
-        }
+        // A seed that snaps to black would duplicate the reserved black
+        // registers and never win a pixel; fill_unlocked_slots skips it.
+        std::vector<Color3f> seed;
+        if (auto q = quantize::quantize(row, 14))
+            for (auto c : q->colors)
+                seed.push_back(snap(c, ste));
+        std::array<Color3f, 16> bank{};
+        std::vector<bool> reserved(16, false);
+        reserved[0] = reserved[15] = true;
+        palette_locks::fill_unlocked_slots(bank, reserved, seed);
+        for (std::size_t k = 0; k < 48; ++k)
+            colors[y][k] = bank[k % 16];
         for (int pass = 0; pass < 12; ++pass) {
             for (std::size_t k = 0; k < 48; ++k)
                 labs[y][k] = color_space::linear_to_oklab(colors[y][k]);

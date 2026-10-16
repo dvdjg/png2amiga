@@ -2,6 +2,7 @@
 #include "thomson.hpp"
 #include "quantize.hpp"
 #include "palette.hpp"
+#include "palette_pairs.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -25,6 +26,9 @@ Color3f rgb3(int r, int g, int b) {
             color_space::srgb_to_linear(static_cast<float>(g) / 7),
             color_space::srgb_to_linear(static_cast<float>(b) / 7)};
 }
+Color3f snap_rgb3(Color3f c) { return rgb3(channel(c.r), channel(c.g), channel(c.b)); }
+int code_rgb3(Color3f c) { return (channel(c.r) << 6) | (channel(c.g) << 3) | channel(c.b); }
+constexpr palette_pairs::Grid kRgb333{snap_rgb3, code_rgb3};
 std::size_t palette_address(int screen) { return screen == 7 ? 0xfa80 : 0x7680; }
 std::size_t frame_size(int screen) {
     if (screen == 2) return 0x3800;
@@ -95,15 +99,22 @@ Result<EncodeResult> encode(const Image& image, amiga::Mode mode,
             }
         } else {
             out.palette = quantize_rgb3(image, screen == 6 ? 4 : 16);
+            out.vram[screen == 7 ? 0xfa00 : 0x7600] = 216; // mode-2 sprite terminator
+        }
+        auto d = dither::apply(image, out.palette, settings);
+        if (screen != 8) {
+            auto encode = [&](const std::vector<Color3f>& p) {
+                return dither::apply(image, std::span<const Color3f>(p), settings);
+            };
+            palette_pairs::joint_refit(image, out.palette, d, {}, kRgb333, false, encode);
+            palette_pairs::refine_with(image, out.palette, d, {}, kRgb333, encode);
             auto base = palette_address(screen);
             for (std::size_t i = 0; i < out.palette.size(); ++i) {
                 auto c = out.palette[i];
                 out.vram[base + 2*i] = static_cast<std::uint8_t>((channel(c.r) << 4) | channel(c.b));
                 out.vram[base + 2*i+1] = static_cast<std::uint8_t>(channel(c.g));
             }
-            out.vram[screen == 7 ? 0xfa00 : 0x7600] = 216; // mode-2 sprite terminator
         }
-        auto d = dither::apply(image, out.palette, settings);
         out.rendered = Image(image.width(), image.height());
         std::size_t bpp = screen == 8 ? 8 : screen == 6 ? 2 : 4;
         std::size_t ppb = 8 / bpp;

@@ -10375,10 +10375,7 @@ int run_main(int argc, char* argv[]) {
             dither_result = dither::apply(*image, pal_span, dith);
         }
 
-        if ((config->mode == amiga::Mode::lores || config->mode == amiga::Mode::hires ||
-             config->mode == amiga::Mode::lores_interlace || config->mode == amiga::Mode::hires_interlace) &&
-            actual_depth >= 2 && actual_depth <= 8 &&
-            !config->dual_playfield &&
+        if (palette_pairs::plain_fit_mode(config->mode) && actual_depth >= 2 && actual_depth <= 8 &&
             !config->copper && !config->scap && config->palette_file.empty() &&
             reserve_count_std == 0 && !has_transparency) {
             pal.colors.resize(pal_size);
@@ -10386,13 +10383,18 @@ int run_main(int argc, char* argv[]) {
                                        pal.colors,
                                        dither_result,
                                        std_locked,
-                                       chipset == amiga::Chipset::aga,
+                                       palette_pairs::grid_for(chipset, config->mode),
                                        false,
                                        [&](const std::vector<Color3f>& p) {
                                            return dither::apply(
                                                *image, std::span<const Color3f>(p), dith);
                                        });
-            palette_pairs::refine(*image, pal.colors, dither_result, dith, std_locked, chipset);
+            palette_pairs::refine(*image,
+                                  pal.colors,
+                                  dither_result,
+                                  dith,
+                                  std_locked,
+                                  palette_pairs::grid_for(chipset, config->mode));
             pal_span = std::span<const Color3f>(pal.colors);
         }
 

@@ -1,4 +1,5 @@
 #pragma once
+#include "console_color.hpp"
 #include "dither.hpp"
 #include "palette.hpp"
 #include "ssimulacra2.hpp"
@@ -39,30 +40,72 @@ inline int thomson_code(Color3f c) {
     };
     return (channel(c.r) << 8) | (channel(c.g) << 4) | channel(c.b);
 }
-inline Color3f snap(Color3f c, bool aga, bool to8 = false) {
-    if (to8) {
-        int code = thomson_code(c);
-        return color_space::srgb_hex_to_linear(
-            palette::thomson_rgb_hex(code >> 8, (code >> 4) & 15, code & 15));
-    }
-    return aga ? palette::aga_to_linear(palette::linear_to_aga(c)) : palette::quantize_to_ocs(c);
+// Hardware colour grid: `snap` rounds to the nearest register value and
+// `code` names that value (equal codes = equal register contents).
+struct Grid {
+    Color3f (*snap)(Color3f);
+    int (*code)(Color3f);
+};
+namespace grids {
+inline Color3f snap_ocs(Color3f c) { return palette::quantize_to_ocs(c); }
+inline int code_ocs(Color3f c) { return palette::linear_to_ocs(c); }
+inline Color3f snap_aga(Color3f c) { return palette::aga_to_linear(palette::linear_to_aga(c)); }
+inline int code_aga(Color3f c) { return static_cast<int>(palette::linear_to_aga(c)); }
+inline Color3f snap_thomson(Color3f c) {
+    int code = thomson_code(c);
+    return color_space::srgb_hex_to_linear(
+        palette::thomson_rgb_hex(code >> 8, (code >> 4) & 15, code & 15));
 }
-inline std::vector<int> key(std::span<const Color3f> colors, bool aga, bool to8 = false) {
+inline Color3f snap_stf(Color3f c) { return palette::quantize_to_stf(c); }
+inline int code_stf(Color3f c) { return palette::linear_to_stf(c); }
+inline Color3f snap_vga(Color3f c) { return palette::quantize_to_vga(c); }
+inline int code_vga(Color3f c) { return static_cast<int>(palette::linear_to_vga(c)); }
+inline Color3f snap_ega(Color3f c) { return palette::quantize_to_ega(c); }
+inline int code_ega(Color3f c) { return palette::linear_to_ega(c); }
+inline Color3f snap_bgr555(Color3f c) { return console_color::bgr555_quantize(c); }
+inline int code_bgr555(Color3f c) { return console_color::to_bgr555_word(c); }
+}  // namespace grids
+inline constexpr Grid kOcs{grids::snap_ocs, grids::code_ocs};
+inline constexpr Grid kAga{grids::snap_aga, grids::code_aga};
+inline constexpr Grid kThomson{grids::snap_thomson, thomson_code};
+inline constexpr Grid kStf{grids::snap_stf, grids::code_stf};
+inline constexpr Grid kVga{grids::snap_vga, grids::code_vga};
+inline constexpr Grid kEga{grids::snap_ega, grids::code_ega};
+inline constexpr Grid kBgr555{grids::snap_bgr555, grids::code_bgr555};
+// The grid snap_palette / snap_to_chipset use for a plain-mode palette.
+inline Grid grid_for(amiga::Chipset chipset, amiga::Mode mode = amiga::Mode::lores) {
+    if (amiga::is_stf(mode)) return kStf;
+    if (amiga::is_vga(mode)) return kVga;
+    if (amiga::is_ega(mode)) return kEga;
+    return chipset == amiga::Chipset::aga ? kAga : kOcs;
+}
+// Single-palette modes whose plain encode is `dither::apply` on a chosen
+// palette: these run joint_refit + refine after the first dither.
+inline bool plain_fit_mode(amiga::Mode m) {
+    using M = amiga::Mode;
+    return m == M::lores || m == M::lores_interlace || m == M::hires || m == M::hires_interlace ||
+           m == M::stf_low || m == M::stf_med || m == M::ste_low || m == M::ste_med ||
+           m == M::vga_13h || m == M::vga_10h || m == M::vga_12h || m == M::ega_hi;
+}
+inline Grid grid_of(bool aga, bool to8) { return to8 ? kThomson : aga ? kAga : kOcs; }
+inline Color3f snap(Color3f c, const Grid& g) { return g.snap(c); }
+inline std::vector<int> key(std::span<const Color3f> colors, const Grid& g) {
     std::vector<int> result;
     for (auto c : colors)
-        result.push_back(to8   ? thomson_code(c)
-                         : aga ? static_cast<int>(palette::linear_to_aga(c))
-                               : palette::linear_to_ocs(c));
+        result.push_back(g.code(c));
     return result;
+}
+inline Color3f snap(Color3f c, bool aga, bool to8 = false) { return snap(c, grid_of(aga, to8)); }
+inline std::vector<int> key(std::span<const Color3f> colors, bool aga, bool to8 = false) {
+    return key(colors, grid_of(aga, to8));
 }
 inline std::vector<Proposal> proposals(const Image& source,
                                        const Frame& f,
                                        const std::vector<bool>& locked,
                                        bool lab,
-                                       bool aga,
+                                       const Grid& grid,
                                        bool ehb = false,
-                                       bool paired = true,
-                                       bool to8 = false) {
+                                       bool paired = true) {
     const auto w = source.width(), h = source.height(), n = w * h,
                k = ehb ? std::size_t{32} : f.palette.size();
     std::vector<double> gram(k * k, 0);
@@ -104,7 +147,7 @@ inline std::vector<Proposal> proposals(const Image& source,
         }
     }
     std::vector<Proposal> out;
-    const auto original_key = key(std::span(f.palette).first(k), aga, to8);
+    const auto original_key = key(std::span(f.palette).first(k), grid);
     const auto unique_before = std::set<int>(original_key.begin(), original_key.end()).size();
     std::set<std::vector<int>> seen;
     for (std::size_t a = 0; a < k; ++a) {
@@ -123,13 +166,13 @@ inline std::vector<Proposal> proposals(const Image& source,
                       static_cast<float>(1 / det);
             for (float step : {0.5f, 1.0f, 1.5f}) {
                 auto pal = f.palette;
-                pal[a] = snap(unspace(colors[a] + da * step, lab), aga, to8);
-                if (paired) pal[b] = snap(unspace(colors[b] + db * step, lab), aga, to8);
+                pal[a] = snap(unspace(colors[a] + da * step, lab), grid);
+                if (paired) pal[b] = snap(unspace(colors[b] + db * step, lab), grid);
                 if (ehb) {
                     pal[a + 32] = palette::half_brite(pal[a]);
                     pal[b + 32] = palette::half_brite(pal[b]);
                 }
-                auto ka = key(std::span(pal).first(k), aga, to8);
+                auto ka = key(std::span(pal).first(k), grid);
                 if (ka == original_key || !seen.insert(ka).second ||
                     std::set<int>(ka.begin(), ka.end()).size() < unique_before)
                     continue;
@@ -148,14 +191,14 @@ inline std::vector<Proposal> proposals(const Image& source,
     return out;
 }
 
+template<class Encode>
 inline void refine_search(const Image& source,
                           std::vector<Color3f>& colors,
                           dither::DitherResult& output,
-                          const dither::Settings& settings,
+                          Encode& encode,
                           const std::vector<bool>& locked,
-                          amiga::Chipset chipset,
+                          const Grid& grid,
                           bool paired) {
-    const bool aga = chipset == amiga::Chipset::aga;
     if (colors.size() < 2 || colors.size() > 256 || output.indices.size() != source.pixels().size())
         return;
     if (std::count(locked.begin(), locked.end(), true) >=
@@ -177,8 +220,8 @@ inline void refine_search(const Image& source,
         std::set<std::vector<int>> seen;
         for (bool lab : {false, true}) {
             int added = 0;
-            for (auto& p : proposals(source, frame, locked, lab, aga, false, paired)) {
-                if (!seen.insert(key(p.palette, aga)).second) continue;
+            for (auto& p : proposals(source, frame, locked, lab, grid, false, paired)) {
+                if (!seen.insert(key(p.palette, grid)).second) continue;
                 candidates.push_back(std::move(p));
                 if (++added == 4) break;
             }
@@ -187,7 +230,7 @@ inline void refine_search(const Image& source,
         auto palette_winner = colors;
         float score = best;
         for (const auto& p : candidates) {
-            auto encoded = dither::apply(source, p.palette, settings);
+            auto encoded = encode(p.palette);
             float trial = ssimulacra2::compute(reference,
                                                render(p.palette, encoded.indices).pixels());
             if (std::isfinite(trial) && trial > score + 0.001f) {
@@ -246,7 +289,7 @@ inline void joint_refit(const Image& source,
                         std::vector<Color3f>& colors,
                         dither::DitherResult& output,
                         const std::vector<bool>& locked,
-                        bool aga,
+                        const Grid& grid,
                         bool ehb,
                         Encode encode) {
     const auto w = source.width(), h = source.height(), n = w * h;
@@ -353,7 +396,7 @@ inline void joint_refit(const Image& source,
                                   static_cast<float>(B[i * 3 + 1]),
                                   static_cast<float>(B[i * 3 + 2])};
                 const Color3f s = (cur_s[k] + (sol - cur_s[k]) * t).clamped();
-                pal[k] = snap(color_space::srgb_to_linear(s), aga);
+                pal[k] = snap(color_space::srgb_to_linear(s), grid);
                 if (ehb) pal[k + 32] = palette::half_brite(pal[k]);
             }
             auto encoded = encode(pal);
@@ -372,20 +415,22 @@ inline void joint_refit(const Image& source,
 }
 // Compare both searches from the original encoding. A two-color step can
 // escape a local optimum; a single-color step can win in sparse palettes.
-inline void refine(const Image& source,
-                   std::vector<Color3f>& colors,
-                   dither::DitherResult& output,
-                   const dither::Settings& settings,
-                   const std::vector<bool>& locked,
-                   amiga::Chipset chipset) {
+// `encode` maps a palette to the caller's exact indexed encoding.
+template<class Encode>
+inline void refine_with(const Image& source,
+                        std::vector<Color3f>& colors,
+                        dither::DitherResult& output,
+                        const std::vector<bool>& locked,
+                        const Grid& grid,
+                        Encode encode) {
     if (colors.size() < 2 || colors.size() > 256 || output.indices.size() != source.pixels().size())
         return;
     const auto original_colors = colors;
     const auto original_output = output;
-    refine_search(source, colors, output, settings, locked, chipset, true);
+    refine_search(source, colors, output, encode, locked, grid, true);
     auto single_colors = original_colors;
     auto single_output = original_output;
-    refine_search(source, single_colors, single_output, settings, locked, chipset, false);
+    refine_search(source, single_colors, single_output, encode, locked, grid, false);
     ssimulacra2::PrecomputedSource reference;
     reference.prepare(source.pixels(), source.width(), source.height());
     auto score = [&](const auto& palette, const auto& indices) {
@@ -398,6 +443,24 @@ inline void refine(const Image& source,
         colors = std::move(single_colors);
         output = std::move(single_output);
     }
+}
+inline void refine(const Image& source,
+                   std::vector<Color3f>& colors,
+                   dither::DitherResult& output,
+                   const dither::Settings& settings,
+                   const std::vector<bool>& locked,
+                   const Grid& grid) {
+    refine_with(source, colors, output, locked, grid, [&](const std::vector<Color3f>& p) {
+        return dither::apply(source, std::span<const Color3f>(p), settings);
+    });
+}
+inline void refine(const Image& source,
+                   std::vector<Color3f>& colors,
+                   dither::DitherResult& output,
+                   const dither::Settings& settings,
+                   const std::vector<bool>& locked,
+                   amiga::Chipset chipset) {
+    refine(source, colors, output, settings, locked, grid_for(chipset));
 }
 // EHB compares independent single-color and paired searches from the same
 // original encoding. The caller supplies its exact EHB quantizer, including
@@ -432,7 +495,7 @@ inline void refine_ehb(const Image& source,
             std::set<std::vector<int>> seen;
             for (bool lab : {false, true}) {
                 int added = 0;
-                for (auto& p : proposals(source, frame, locked, lab, false, true, paired)) {
+                for (auto& p : proposals(source, frame, locked, lab, kOcs, true, paired)) {
                     if (!seen.insert(key(p.palette, false)).second) continue;
                     candidates.push_back(std::move(p));
                     if (++added == 4) break;

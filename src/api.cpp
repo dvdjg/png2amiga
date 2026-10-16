@@ -994,23 +994,21 @@ Result<PlainAutoTrial> encode_plain_auto(const Image& img,
     } else {
         dr = dither::apply(img, pal_span, dith);
     }
-    if (fit_pairs &&
-        (mode == amiga::Mode::lores || mode == amiga::Mode::hires ||
-         mode == amiga::Mode::lores_interlace || mode == amiga::Mode::hires_interlace) &&
-        depth >= 2 && depth <= 8 &&
-        !use_dpf && reserve_count == 0 && !has_transparency) {
+    if (fit_pairs && palette_pairs::plain_fit_mode(mode) && depth >= 2 && depth <= 8 &&
+        reserve_count == 0 && !has_transparency) {
         out.pal.colors.resize(out.pal_size);
         palette_pairs::joint_refit(img,
                                    out.pal.colors,
                                    dr,
                                    out.locked_mask,
-                                   chipset == amiga::Chipset::aga,
+                                   palette_pairs::grid_for(chipset, mode),
                                    false,
                                    [&](const std::vector<Color3f>& p) {
                                        return dither::apply(
                                            img, std::span<const Color3f>(p), dith);
                                    });
-        palette_pairs::refine(img, out.pal.colors, dr, dith, out.locked_mask, chipset);
+        palette_pairs::refine(
+            img, out.pal.colors, dr, dith, out.locked_mask, palette_pairs::grid_for(chipset, mode));
         pal_span = std::span<const Color3f>(out.pal.colors);
     }
     out.indices = std::move(dr.indices);
@@ -1833,6 +1831,10 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         auto qr = palette_locks::two_pass_quantize(
             qfn, qc_vga.qcount, qc_vga.kfallback, options.lock_color0);
         if (!qr) return std::unexpected{qr.error()};
+        // Snap before assembly (as the CLI does) so a centroid that lands on
+        // a locked colour is dropped rather than duplicated.
+        for (auto& c : qr->colors)
+            c = palette::quantize_to_vga(c);
         auto assembled = palette_locks::assemble_with_reserves(
             *qr, options.locks, options.reserves, max_colors, options.lock_color0, chipset, mode);
         Palette pal = std::move(assembled.palette);
@@ -1868,6 +1870,20 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 idx = cand_to_full[idx];
         } else {
             dith_result = dither::apply(*image, pal.colors, dith);
+            if (!has_transparency) {
+                palette_pairs::joint_refit(*image,
+                                           pal.colors,
+                                           dith_result,
+                                           assembled.locked,
+                                           palette_pairs::kVga,
+                                           false,
+                                           [&](const std::vector<Color3f>& p) {
+                                               return dither::apply(
+                                                   *image, std::span<const Color3f>(p), dith);
+                                           });
+                palette_pairs::refine(
+                    *image, pal.colors, dith_result, dith, assembled.locked, palette_pairs::kVga);
+            }
         }
         // Reseat `quantized` so the rest of the block can keep using
         // its name without further surgery.
@@ -2267,6 +2283,8 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             }
         } else {
             enc = thomson::encode(*image, mode, dith, {}, nullptr, options.cell_refine);
+            if (enc && amiga::is_thomson_programmable(mode))
+                enc = thomson::fit_palette(*image, std::move(*enc), mode, dith, options.cell_refine);
             if (enc && mode == amiga::Mode::thomson_to8_320x16)
                 enc = thomson::refine_palette(*image, std::move(*enc), dith, options.cell_refine);
         }
@@ -2697,6 +2715,10 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 };
                 auto qr = palette_locks::two_pass_quantize(qfn, qc.qcount, qc.kfallback, lock_zero);
                 if (!qr) return std::unexpected{qr.error()};
+                // Snap first so a centroid that lands on a locked colour is
+                // dropped by the assembly instead of duplicated.
+                for (auto& c : qr->colors)
+                    c = console_color::bgr555_quantize(c);
                 auto assembled = palette_locks::assemble_with_reserves(
                     *qr, options.locks, options.reserves, kColors, lock_zero, chipset, mode);
                 pal = std::move(assembled.palette);
@@ -2728,6 +2750,20 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                     idx = cand_to_full[idx];
             } else {
                 dith_result = dither::apply(*image, pal.colors, dith);
+                if (!user_pal && !has_transparency) {
+                    palette_pairs::joint_refit(*image,
+                                               pal.colors,
+                                               dith_result,
+                                               locked_mask,
+                                               palette_pairs::kBgr555,
+                                               false,
+                                               [&](const std::vector<Color3f>& p) {
+                                                   return dither::apply(
+                                                       *image, std::span<const Color3f>(p), dith);
+                                               });
+                    palette_pairs::refine(
+                        *image, pal.colors, dith_result, dith, locked_mask, palette_pairs::kBgr555);
+                }
             }
 
             // --pin-index-at: pin a slot to the source pixel at (x,y) and
@@ -3834,7 +3870,7 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                                            ehb_pal.colors,
                                            dither_result,
                                            base_locked,
-                                           false,
+                                           palette_pairs::kOcs,
                                            true,
                                            [&](const std::vector<Color3f>& p) {
                                                return encode_palette(
