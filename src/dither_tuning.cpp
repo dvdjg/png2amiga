@@ -271,20 +271,22 @@ Defaults defaults_for(const Context& ctx) {
         // across rows whose palettes differ (DIV2K 0267: 35.9 -> 52.7).
         if (ctx.mode == amiga::Mode::ehb) return Defaults{0.74f, 0.20f};
         if (ctx.mode == amiga::Mode::lores || ctx.mode == amiga::Mode::lores_interlace) {
+            // The 1.0 strengths were swept at mean S2 21-48. Resweep
+            // 2026-10-15 on the DitherWindow planner (75a88cea), 13
+            // test-suite-lores images outside the evaluation set,
+            // strength {0.6..1.0} x clamp {0.10, 0.35}; 1.0 is now the
+            // worst column at every depth.
             if (ctx.chipset == amiga::Chipset::aga) {
                 switch (ctx.depth) {
                 case 4:
-                    return Defaults{1.0f, 0.10f};  // mean 33.20
+                    return Defaults{0.80f, 0.35f};  // S2 50.83 (1.0/0.10: 48.42)
                 case 5:
-                    return Defaults{1.0f, 0.10f};  // mean 37.19
                 case 6:
-                    return Defaults{1.0f, 0.06f};  // mean 44.33
                 case 7:
-                    // Was a fall-through hole (switch jumped 6->8). Clamp
-                    // interpolates the 0.06/0.04 ramp; tuning-set mean S2 ~84.2.
-                    return Defaults{1.0f, 0.05f};
                 case 8:
-                    return Defaults{1.0f, 0.04f};  // mean 48.14
+                    // d5 67.72, d6 74.89, d7 80.62, d8 84.15
+                    // (1.0/0.10: 65.58 / 71.81 / 78.08 / 81.63)
+                    return Defaults{0.70f, 0.35f};
                 default:
                     break;
                 }
@@ -293,9 +295,9 @@ Defaults defaults_for(const Context& ctx) {
                 case 2:
                     return Defaults{1.0f, 0.10f};  // mean 21.76
                 case 3:
-                    return Defaults{1.0f, 0.20f};  // mean 26.89
+                    return Defaults{0.70f, 0.10f};  // S2 14.28 (1.0/0.10: 11.72)
                 case 4:
-                    return Defaults{1.0f, 0.04f};  // mean 30.92
+                    return Defaults{0.60f, 0.35f};  // S2 45.02 (1.0/0.10: 40.72)
                 case 5:
                     // 1.0/0.10 was swept at mean S2 35.61; at today's ~54 it
                     // over-diffuses (34-image DIV2K set: 51.06 -> 53.40;
@@ -309,9 +311,9 @@ Defaults defaults_for(const Context& ctx) {
         if (ctx.mode == amiga::Mode::hires || ctx.mode == amiga::Mode::hires_interlace) {
             switch (ctx.depth) {
             case 3:
-                return Defaults{1.0f, 0.10f};  // mean 26.48
+                return Defaults{0.80f, 0.35f};  // S2 10.45 (1.0/0.10: 6.06)
             case 4:
-                return Defaults{1.0f, 0.20f};  // mean 30.68
+                return Defaults{0.80f, 0.35f};  // S2 39.20 (1.0/0.35: 27.01)
             // d5-8 (AGA-only; OCS hires maxes at 4bpp) were a fall-through
             // hole -> the loose kFallback{1.0, 0.35} let FS error run away
             // against the per-line palette, dumping opposite-hue speckle
