@@ -648,11 +648,10 @@ Result<CopperResult> encode_copper(const Image& image,
         // their indices, quantized in the remaining unlocked slots in
         // order. Skipping locked indices when filling means the
         // quantizer's colors land specifically where the dither will
-        // actually be able to use them. Note: the K=k1 quantizer doesn't
-        // see the reserve set, so an occasional pick may bit-match a
-        // reserve — find_best_swap below catches the per-line variant
-        // (the more common leak vector) by rejecting centroids that
-        // OCS-snap onto a reserved color.
+        // actually be able to use them. Quantizer picks that bit-match a
+        // locked colour are dropped here; find_best_swap below catches the
+        // per-line variant by rejecting centroids that OCS-snap onto a
+        // reserved color.
         base_pal.assign(num_colors, Color3f{0.0f, 0.0f, 0.0f});
         std::vector<bool> base_locked(num_colors, false);
         if (lock_color0) {
@@ -665,11 +664,10 @@ Result<CopperResult> encode_copper(const Image& image,
                 base_locked[idx] = true;
             }
         }
-        std::size_t qi = 0;
-        for (std::size_t i = 0; i < num_colors; ++i) {
-            if (base_locked[i]) continue;
-            if (qi < pr->colors.size()) base_pal[i] = pr->colors[qi++];
-        }
+        // The K retry in two_pass_quantize returns the black slot 0 already
+        // holds; an in-order fill duplicated it at slot 1 and dropped the
+        // brightest colour (DIV2K 0041: S2 56 -> 27).
+        palette_locks::fill_unlocked_slots(base_pal, base_locked, pr->colors);
     }
 
     // Step 2: Iterative two-pass predict+dither loop.

@@ -297,7 +297,10 @@ Defaults defaults_for(const Context& ctx) {
                 case 4:
                     return Defaults{1.0f, 0.04f};  // mean 30.92
                 case 5:
-                    return Defaults{1.0f, 0.10f};  // mean 35.61
+                    // 1.0/0.10 was swept at mean S2 35.61; at today's ~54 it
+                    // over-diffuses (34-image DIV2K set: 51.06 -> 53.40;
+                    // plain lores d5 51.48). Same optimum as plain d5.
+                    return Defaults{0.72f, 0.35f};
                 default:
                     break;
                 }

@@ -215,6 +215,29 @@ void finalize_palette(std::vector<Color3f>& colors, std::size_t num_colors, bool
         colors.push_back(Color3f{0.0f, 0.0f, 0.0f});
 }
 
+void fill_unlocked_slots(std::span<Color3f> colors,
+                         const std::vector<bool>& locked,
+                         std::span<const Color3f> quantized) {
+    constexpr float eps = 1e-6f;
+    auto is_locked_dup = [&](const Color3f& c) {
+        for (std::size_t i = 0; i < colors.size() && i < locked.size(); ++i) {
+            if (!locked[i]) continue;
+            const auto& l = colors[i];
+            if (std::abs(c.r - l.r) < eps && std::abs(c.g - l.g) < eps &&
+                std::abs(c.b - l.b) < eps)
+                return true;
+        }
+        return false;
+    };
+    std::size_t qi = 0;
+    for (std::size_t i = 0; i < colors.size(); ++i) {
+        if (i < locked.size() && locked[i]) continue;
+        while (qi < quantized.size() && is_locked_dup(quantized[qi]))
+            ++qi;
+        if (qi < quantized.size()) colors[i] = quantized[qi++];
+    }
+}
+
 AssembledPalette assemble_locked_palette(const Palette& quantized,
                                          const std::vector<LockSpec>& locks,
                                          std::size_t max_colors,

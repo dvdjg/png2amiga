@@ -2048,11 +2048,8 @@ Result<ScapResult> encode_strips_ehb_ocs(
                     placed_locked[idx] = true;
                 }
             }
-            std::size_t qi = 0;
-            for (std::size_t i = 0; i < 32; ++i) {
-                if (placed_locked[i]) continue;
-                if (qi < seed_pal.colors.size()) placed[i] = seed_pal.colors[qi++];
-            }
+            // Skip the K-retry black slot 0 already holds (see copper.cpp).
+            palette_locks::fill_unlocked_slots(placed, placed_locked, seed_pal.colors);
             seed_pal.colors = std::move(placed);
             // Build refine's locked mask: lock_color0 + reserved slots are
             // held fixed during refine so its iterative convergence is
