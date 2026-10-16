@@ -3,6 +3,7 @@
 #include "color_space.hpp"
 #include "types.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -414,12 +415,78 @@ struct PickResult {
     // ∈ [0, 0.5]. Pickers without a meaningful "second nearest" (raw grid
     // snap, HAM ops) leave this at 0.5 → unit kernel scale.
     float ostro_threshold = 0.5f;
+    // Optional: sRGB of chosen_lab, exactly
+    // linear_to_srgb(oklab_to_linear(chosen_lab)).clamped(), for pickers that
+    // cache it per palette entry. Null = computed per pixel.
+    const Color3f* chosen_srgb = nullptr;
 };
 
 using PixelPicker =
     std::function<PickResult(const color_space::OKLab& target, std::size_t x, std::size_t y)>;
 
 float diffuse_raw_buffer(const Image& image, const Settings& settings, const PixelPicker& pick);
+
+// diffuse_raw_buffer one row at a time. DiffuseRows holds the per-image
+// setup (kernel, bias map, Riemersma weights, optionally the source in OKLab
+// and sRGB); DiffuseState holds what carries from row to row. A copy of the
+// state taken before row y resumes the scan there with the same result.
+// diffuse_raw_buffer is start() + row(0..h-1).
+//
+// DiffuseSource: the per-pixel source conversions of an image, for callers
+// that scan the same pixels many times.
+struct DiffuseSource {
+    std::size_t width = 0;
+    std::vector<color_space::OKLab> lab;  // linear_to_oklab(pixel)
+    std::vector<Color3f> srgb;            // linear_to_srgb(pixel).clamped()
+};
+DiffuseSource diffuse_source(const Image& image);
+
+struct DiffuseState {
+    std::vector<Color3f> err_s;
+    std::vector<color_space::OKLab> err_lab;
+    std::array<Color3f, 16> riem_queue{};
+    std::size_t riem_head = 0;
+    float total_error = 0.0f;
+};
+
+class DiffuseRows {
+public:
+    // `image`, `settings` and `source` must outlive this object. `source`,
+    // if given, holds the conversions of `image`'s pixels, image row y being
+    // source row first_row + y.
+    DiffuseRows(const Image& image,
+                const Settings& settings,
+                const DiffuseSource* source = nullptr,
+                std::size_t first_row = 0);
+    DiffuseRows(const DiffuseRows&) = delete;
+    DiffuseRows& operator=(const DiffuseRows&) = delete;
+    DiffuseState start() const;
+    void row(DiffuseState& st, std::size_t y, const PixelPicker& pick) const;
+    bool diffuses() const { return is_diff_; }
+    // Copies into `out` the part of `st` that rows y.. still read: error
+    // rows y .. y+reach-1 (rows below are still zero, rows above are done),
+    // the Riemersma queue and the total.
+    void save(const DiffuseState& st, std::size_t y, DiffuseState& out) const;
+    // Makes `st` (whatever it held) the state `saved` was saved from at y.
+    void restore(const DiffuseState& saved, std::size_t y, DiffuseState& st) const;
+
+private:
+    static constexpr std::size_t kRiemQueue = 16;
+    const Image* image_;
+    const Settings* settings_;
+    std::size_t w_;
+    std::size_t h_;
+    bool is_ord_{};
+    bool is_diff_{};
+    bool needs_riem_{};
+    bool is_oklab_{};
+    std::span<const DiffusionEntry> kernel_;
+    std::size_t reach_ = 0;  // rows below the current one the kernel writes
+    std::vector<float> bias_map_;
+    std::array<float, kRiemQueue> riem_weights_{};
+    const color_space::OKLab* src_lab_ = nullptr;  // row 0 of the image
+    const Color3f* src_s_ = nullptr;
+};
 
 // Per-cell mirrored 3×3 error diffusion for tile / character modes. Each
 // cell_w×cell_h cell is diffused on its own inside a 3W×3H buffer whose
@@ -468,6 +535,13 @@ float pick_palette_index_with_ostro(Method method,
                                     std::size_t k_min,
                                     std::size_t& chosen_index,
                                     png2amiga::color_space::OKLab& chosen_lab);
+
+// The index pick_palette_index_with_ostro picks for a non-Yliluoma method
+// (nearest entry from k_min on, first on ties), without the second-nearest
+// distance it also needs for the threshold.
+std::size_t nearest_palette_index(const png2amiga::color_space::OKLab& target,
+                                  std::span<const png2amiga::color_space::OKLab> palette_lab,
+                                  std::size_t k_min = 0);
 
 // Dispatch helper for the yliluoma family — picks the right
 // per-pixel quantizer (opt_checker/opt_line/opt_line_checker/knoll/

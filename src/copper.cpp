@@ -6,6 +6,7 @@
 #include "palette.hpp"
 #include "palette_locks.hpp"
 #include "palette_pairs.hpp"
+#include "pipeline.hpp"
 #include "quantize.hpp"
 #include "quantize_metal.hpp"
 #include "types.hpp"
@@ -17,8 +18,10 @@
 #include <format>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 
 namespace png2amiga::copper {
@@ -39,6 +42,20 @@ struct SwapCandidate {
     std::size_t slot;       // palette register to replace
     Color3f new_color;      // replacement color
     float error_reduction;  // how much error this swap saves
+};
+
+// find_best_swap's per-slot results for one SwapScratch state. A slot's
+// centroid swap does not depend on which other slots are excluded, so
+// repeated calls between scratch refreshes reuse it.
+struct SlotSwapCache {
+    struct Entry {
+        bool have_reduction = false;
+        bool have_color = false;
+        float reduction = 0.0f;
+        Color3f color{};
+    };
+    std::vector<Entry> slots;
+    void clear() { slots.clear(); }
 };
 
 // Per-slot cluster stats (weighted sums + error) from a pass of
@@ -210,7 +227,8 @@ SwapCandidate find_best_swap(std::span<const Color3f> current_pal,
                              const std::vector<bool>& excluded = {},
                              std::span<const float> column_weights = {},
                              std::span<const Color3f> hist_pool = {},
-                             std::span<const color_space::OKLab> hist_pool_lab = {}) {
+                             std::span<const color_space::OKLab> hist_pool_lab = {},
+                             SlotSwapCache* cache = nullptr) {
 
     (void)rows;
     (void)current_lab;
@@ -226,10 +244,12 @@ SwapCandidate find_best_swap(std::span<const Color3f> current_pal,
     // assigned pixels' centroid (the ideal color for that cluster).
     // The slot with the highest error reduction wins.
     SwapCandidate best{0, {}, -1.0f};
+    if (cache && cache->slots.size() != num_colors) cache->slots.assign(num_colors, {});
 
     for (std::size_t k = 0; k < num_colors; ++k) {
         if (stats[k].count < 0.001) continue;
         if (!excluded.empty() && excluded[k]) continue;
+        SlotSwapCache::Entry* ce = cache ? &cache->slots[k] : nullptr;
 
         // Ideal centroid for this cluster (weighted by neighbor rows)
         auto n = stats[k].count;
@@ -239,27 +259,45 @@ SwapCandidate find_best_swap(std::span<const Color3f> current_pal,
             static_cast<float>(stats[k].sum_b / n),
         };
 
-        // Error with the centroid — use cached assignments
-        double new_error = 0.0;
-        for (std::size_t r = 0; r < rows_lab.size(); ++r) {
-            auto& rl = rows_lab[r];
-            auto base = r * width;
-            for (std::size_t x = 0; x < width; ++x) {
-                if (assignments[base + x] != k) continue;
-                float dL = rl[x].L - centroid.L;
-                float da = rl[x].a - centroid.a;
-                float db = rl[x].b - centroid.b;
-                new_error += static_cast<double>(color_space::fma_dist_sq(dL, da, db)) *
-                             static_cast<double>(pixel_weights[base + x]);
+        float reduction = 0.0f;
+        if (ce && ce->have_reduction) {
+            reduction = ce->reduction;
+        } else {
+            // Error with the centroid — use cached assignments
+            double new_error = 0.0;
+            for (std::size_t r = 0; r < rows_lab.size(); ++r) {
+                auto& rl = rows_lab[r];
+                auto base = r * width;
+                for (std::size_t x = 0; x < width; ++x) {
+                    if (assignments[base + x] != k) continue;
+                    float dL = rl[x].L - centroid.L;
+                    float da = rl[x].a - centroid.a;
+                    float db = rl[x].b - centroid.b;
+                    new_error += static_cast<double>(color_space::fma_dist_sq(dL, da, db)) *
+                                 static_cast<double>(pixel_weights[base + x]);
+                }
+            }
+            reduction = static_cast<float>(stats[k].total_error - new_error);
+            if (ce) {
+                ce->have_reduction = true;
+                ce->reduction = reduction;
             }
         }
 
-        auto reduction = static_cast<float>(stats[k].total_error - new_error);
         if (reduction > best.error_reduction) {
-            auto linear = color_space::oklab_to_linear(centroid).clamped();
-            // Snap to chipset precision
-            if (chipset != amiga::Chipset::aga) {
-                linear = palette::quantize_to_ocs(linear);
+            Color3f linear{};
+            if (ce && ce->have_color) {
+                linear = ce->color;
+            } else {
+                linear = color_space::oklab_to_linear(centroid).clamped();
+                // Snap to chipset precision
+                if (chipset != amiga::Chipset::aga) {
+                    linear = palette::quantize_to_ocs(linear);
+                }
+                if (ce) {
+                    ce->have_color = true;
+                    ce->color = linear;
+                }
             }
             // [Histogram-pool snap experiment: tested and rejected.
             //  Snapping centroid to the nearest source color in a
@@ -432,14 +470,14 @@ SwapCandidate find_best_swap_ehb(std::span<const color_space::OKLab> current_lab
 // with a far colour (red speckle in 0256's black, a light dot band in 0386's
 // sky) while the planner's nearest-colour error goes down.
 //
-// This window runs the real sliced picker (diffuse_raw_buffer +
-// pick_palette_index_with_ostro, as pass 2) over rows y-kWarm .. y+kAhead.
+// This window runs the real sliced picker (dither::DiffuseRows, the row form
+// of diffuse_raw_buffer, with pass 2's nearest pick) over rows y-kWarm .. y+kAhead.
 // Rows above y keep the palettes already planned, so error arrives at row
 // y as it does in the output. Rows from y on use the trial palette, since a
 // swap stays in effect until a later row changes the slot again. Interlace:
 // rows of the other field use that field's current palette.
 //
-// score() returns two terms over rows y.. (weighted decay^(row-y)):
+// A trial is scored by two terms over rows y.. (weighted decay^(row-y)):
 //   blurred  error of the result against the source after a horizontal box
 //            (half-widths 1, 3, 7) and a vertical [1 2 1] filter, summed
 //            over the three scales: what the eye averages the dither into.
@@ -454,6 +492,13 @@ SwapCandidate find_best_swap_ehb(std::span<const color_space::OKLab> current_lab
 // there (0779: 84.8 vs 82.5).
 constexpr std::size_t kDitherCheckMaxColors = 32;
 
+// Trials DitherWindow::try_batch scores in parallel. The result does not
+// depend on it.
+std::size_t trial_batch() {
+    static const std::size_t n = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, 8);
+    return n;
+}
+
 class DitherWindow {
 public:
     static constexpr std::size_t kWarm = 4;
@@ -464,8 +509,10 @@ public:
         double raw{};
     };
 
+    // `source`: dither::diffuse_source(image).
     DitherWindow(const Image& image,
                  const std::vector<std::vector<color_space::OKLab>>& all_lab,
+                 const dither::DiffuseSource& source,
                  const dither::Settings& settings,
                  std::size_t y,
                  bool is_lace,
@@ -482,19 +529,23 @@ public:
             std::copy(src.begin(), src.end(), px.begin() + static_cast<std::ptrdiff_t>(r * width_));
         }
         win_ = Image(width_, rows_, std::move(px));
+        diffuser_.emplace(win_, settings_, &source, y0_);
         row_w_.resize(rows_);
         for (std::size_t r = 0; r < rows_; ++r) {
             auto gy = y0_ + r;
             row_w_[r] = gy < y ? 0.0f : std::pow(decay, static_cast<float>(gy - y));
         }
+        first_trial_ = y - y0_;
+        nearest_ = !dither::is_yliluoma(settings.method);
         fixed_.resize(rows_);
-        err_.resize(width_ * rows_);
-        box_.resize(width_ * rows_);
+        fixed_s_.resize(rows_);
+        init(inc_);
     }
 
     // Palette (usable entries only, OKLab) for window row r when that row is
     // not driven by the trial palette: a row above y, or the other field.
     void set_fixed(std::size_t r, std::vector<color_space::OKLab> lab) {
+        fixed_s_[r] = to_srgb(lab);
         fixed_[r] = std::move(lab);
     }
     std::size_t rows() const { return rows_; }
@@ -504,103 +555,388 @@ public:
         return gy >= y_ && (!lace_ || ((gy ^ y_) & 1) == 0);
     }
 
-    Score score(std::span<const color_space::OKLab> trial) {
-        dither::diffuse_raw_buffer(
-            win_,
-            settings_,
-            [&](const color_space::OKLab& target,
-                std::size_t x,
-                std::size_t r) -> dither::PickResult {
-                std::span<const color_space::OKLab> pal = uses_trial(r)
-                                                              ? trial
-                                                              : std::span<const color_space::OKLab>(
-                                                                    fixed_[r]);
-                std::size_t k = 0;
-                color_space::OKLab chosen{};
-                float thr = dither::pick_palette_index_with_ostro(settings_.method,
-                                                                  target,
-                                                                  pal,
-                                                                  x,
-                                                                  y0_ + r,
-                                                                  settings_.strength,
-                                                                  /*k_min=*/0,
-                                                                  k,
-                                                                  chosen);
-                const auto& s = all_lab_[y0_ + r][x];
-                err_[r * width_ + x] = {chosen.L - s.L, chosen.a - s.a, chosen.b - s.b};
-                return {chosen, thr};
-            });
+    // The palette from row y on before any swap. Rows above y do not depend
+    // on it: they are dithered here, once. Its rows from y on run with the
+    // first batch of trials.
+    void set_incumbent(std::span<const color_space::OKLab> trial) {
+        inc_pal_.assign(trial.begin(), trial.end());
+        inc_pal_s_ = to_srgb(inc_pal_);
+        auto state = diffuser_->start();
+        Score unused;
+        scratch_.init(width_);
+        run_into(inc_, scratch_, 0, first_trial_, state, inc_pal_, inc_pal_s_, nullptr, unused);
+        diffuser_->save(state, first_trial_, inc_.snap[first_trial_]);
+        pending_ = true;
+    }
 
+    // Trials are judged as a full window dither would judge them: kept
+    // only if blurred drops below the incumbent's blurred and raw does not
+    // rise above its raw. The work is less:
+    //   - rows before the first one whose picks can change are the
+    //     incumbent's: resume from its saved error state there.
+    //   - both terms are sums of non-negative row terms in a fixed order,
+    //     so a partial sum that already fails the test rejects the trial.
+    //   - all trials of a batch are scored against the same incumbent in
+    //     parallel; the first kept one wins, as in a one-by-one scan.
+    // Returns the index of the first trial kept (now the incumbent), or
+    // trials.size() if none is.
+    std::size_t try_batch(std::span<const std::vector<color_space::OKLab>> trials) {
+        const auto n = trials.size();
+        // Trial buffers outlive the window (one per row): kept per thread
+        // and only resized.
+        thread_local std::vector<std::unique_ptr<Work>> pool;
+        while (pool.size() < n)
+            pool.push_back(std::make_unique<Work>());
+        for (; ready_ < n; ++ready_) {
+            init(pool[ready_]->t);
+            pool[ready_]->scratch.init(width_);
+        }
+        auto& work_ = pool;
+        if (pending_) {
+            // Incumbent rows from y on in parallel with the trials, which
+            // then start at row y and have no bound to stop early against.
+            pipeline::parallel_for(n + 1, [&](std::size_t i) {
+                if (i == n) {
+                    diffuser_->restore(inc_.snap[first_trial_], first_trial_, inc_state_);
+                    auto& state = inc_state_;
+                    run_into(inc_,
+                             scratch_,
+                             first_trial_,
+                             rows_,
+                             state,
+                             inc_pal_,
+                             inc_pal_s_,
+                             nullptr,
+                             cur_);
+                } else {
+                    evaluate(*work_[i], trials[i], nullptr);
+                }
+            });
+            pending_ = false;
+            for (std::size_t i = 0; i < n; ++i) {
+                auto& w = *work_[i];
+                w.kept = w.done && w.score.blurred < cur_.blurred && w.score.raw <= cur_.raw;
+            }
+        } else if (n == 1) {
+            evaluate(*work_[0], trials[0], &cur_);
+        } else {
+            pipeline::parallel_for(n,
+                                   [&](std::size_t i) { evaluate(*work_[i], trials[i], &cur_); });
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!work_[i]->kept) continue;
+            adopt(*work_[i], trials[i]);
+            cur_ = work_[i]->score;
+            return i;
+        }
+        return n;
+    }
+
+private:
+    struct Trace {
+        // Per pixel: picker target, its distance to the picked entry and
+        // that entry's index.
+        std::vector<color_space::OKLab> target;
+        std::vector<float> best_d;
+        std::vector<std::uint8_t> best_k;
+        // Horizontal box of the error at half-widths 1, 3, 7.
+        std::array<std::vector<color_space::OKLab>, 3> box;
+        // Weighted per-row terms of raw and of blurred (per box width).
+        std::vector<double> raw_t;
+        std::array<std::vector<double>, 3> blur_t;
+        // Diffusion state before each row from the first trial row on
+        // (DiffuseRows::save form).
+        std::vector<dither::DiffuseState> snap;
+    };
+    // Per-row buffers of one window dither.
+    struct Scratch {
+        std::vector<color_space::OKLab> err_row;
+        std::vector<double> pL, pa, pb;
+        void init(std::size_t width) {
+            err_row.resize(width);
+            pL.resize(width + 1);
+            pa.resize(width + 1);
+            pb.resize(width + 1);
+        }
+    };
+    // One trial's scratch.
+    struct Work {
+        Trace t;
+        Scratch scratch;
+        std::vector<Color3f> trial_s;
+        std::size_t r0{};
+        dither::DiffuseState state;
+        bool done{};  // dithered to the last row (score is final)
+        bool kept{};
+        Score score;
+    };
+    static constexpr std::array<std::size_t, 3> kHalfWidths{1, 3, 7};
+
+    void init(Trace& t) const {
+        t.target.resize(width_ * rows_);
+        t.best_d.resize(width_ * rows_);
+        t.best_k.resize(width_ * rows_);
+        for (auto& b : t.box)
+            b.resize(width_ * rows_);
+        t.raw_t.assign(rows_, 0.0);
+        for (auto& b : t.blur_t)
+            b.assign(rows_, 0.0);
+        t.snap.resize(rows_);
+    }
+
+    static std::vector<Color3f> to_srgb(std::span<const color_space::OKLab> lab) {
+        std::vector<Color3f> s(lab.size());
+        for (std::size_t k = 0; k < lab.size(); ++k)
+            s[k] = color_space::linear_to_srgb(color_space::oklab_to_linear(lab[k])).clamped();
+        return s;
+    }
+
+    // Scores one trial into w (reads only shared state, so trials run in
+    // parallel). With `cur`, the incumbent is complete: the trial resumes
+    // where its picks can first differ, stops once it cannot beat cur, and
+    // w.kept is the verdict. Without, it starts at row y and runs to the end.
+    void evaluate(Work& w, std::span<const color_space::OKLab> trial, const Score* cur) const {
+        w.kept = false;
+        w.done = false;
+        w.trial_s = to_srgb(trial);
+        std::size_t r0 = first_trial_;
+        if (cur && nearest_ && trial.size() == inc_pal_.size()) r0 = first_divergent_row(trial);
+        w.r0 = r0;
+        if (r0 >= rows_) return;  // same picks everywhere: same score, not lower
+        auto& t = w.t;
+        // Rows before r0 are the incumbent's; their box rows feed the
+        // vertical filter of rows r0-1 and r0.
+        for (std::size_t r = (r0 >= 2 ? r0 - 2 : 0); r < r0; ++r)
+            for (std::size_t s = 0; s < 3; ++s)
+                std::copy_n(inc_.box[s].begin() + static_cast<std::ptrdiff_t>(r * width_),
+                            width_,
+                            t.box[s].begin() + static_cast<std::ptrdiff_t>(r * width_));
+        for (std::size_t r = 0; r < r0; ++r)
+            t.raw_t[r] = inc_.raw_t[r];
+        for (std::size_t s = 0; s < 3; ++s)
+            for (std::size_t r = 0; r + 1 < r0; ++r)
+                t.blur_t[s][r] = inc_.blur_t[s][r];
         Score sc;
-        for (std::size_t r = 0; r < rows_; ++r) {
-            if (row_w_[r] == 0.0f) continue;
+        diffuser_->restore(inc_.snap[r0], r0, w.state);
+        auto& state = w.state;
+        if (!run_into(t, w.scratch, r0, rows_, state, trial, w.trial_s, cur, sc)) return;
+        w.done = true;
+        w.score = sc;
+        if (cur) w.kept = sc.blurred < cur->blurred && sc.raw <= cur->raw;
+    }
+
+    // Makes a kept trial the incumbent from its first changed row on.
+    void adopt(Work& w, std::span<const color_space::OKLab> trial) {
+        auto& c = w.t;
+        const auto r0 = w.r0;
+        auto off = static_cast<std::ptrdiff_t>(r0 * width_);
+        std::copy(c.target.begin() + off, c.target.end(), inc_.target.begin() + off);
+        std::copy(c.best_d.begin() + off, c.best_d.end(), inc_.best_d.begin() + off);
+        std::copy(c.best_k.begin() + off, c.best_k.end(), inc_.best_k.begin() + off);
+        for (std::size_t s = 0; s < 3; ++s) {
+            std::copy(c.box[s].begin() + off, c.box[s].end(), inc_.box[s].begin() + off);
+            inc_.blur_t[s] = c.blur_t[s];
+        }
+        inc_.raw_t = c.raw_t;
+        for (std::size_t r = r0 + 1; r < rows_; ++r)
+            std::swap(inc_.snap[r], c.snap[r]);
+        inc_pal_.assign(trial.begin(), trial.end());
+        std::swap(inc_pal_s_, w.trial_s);
+    }
+
+    // First trial row with a pixel whose pick can differ from the
+    // incumbent's: it picked a changed entry, or a changed entry is as near
+    // to its target (with margin for rounding) as the pick.
+    std::size_t first_divergent_row(std::span<const color_space::OKLab> trial) const {
+        std::array<std::size_t, 256> changed{};
+        std::size_t n_changed = 0;
+        for (std::size_t k = 0; k < trial.size() && k < changed.size(); ++k) {
+            const auto& a = trial[k];
+            const auto& b = inc_pal_[k];
+            if (a.L != b.L || a.a != b.a || a.b != b.b) changed[n_changed++] = k;
+        }
+        if (n_changed == 0) return rows_;
+        for (std::size_t r = first_trial_; r < rows_; ++r) {
+            if (!uses_trial(r)) continue;
+            for (std::size_t x = 0; x < width_; ++x) {
+                auto i = r * width_ + x;
+                const auto& t = inc_.target[i];
+                float bound = inc_.best_d[i] * 1.0001f + 1e-12f;
+                for (std::size_t c = 0; c < n_changed; ++c) {
+                    auto k = changed[c];
+                    if (inc_.best_k[i] == k) return r;
+                    const auto& e = trial[k];
+                    if (color_space::fma_dist_sq(t.L - e.L, t.a - e.a, t.b - e.b) <= bound)
+                        return r;
+                }
+            }
+        }
+        return rows_;
+    }
+
+    // Lower bounds of the final sums: the same ordered sums over the terms
+    // known so far (unknown terms are >= 0).
+    Score partial(const Trace& t, std::size_t raw_rows, std::size_t blur_rows) const {
+        Score sc;
+        for (std::size_t r = 0; r < raw_rows; ++r)
+            if (row_w_[r] != 0.0f) sc.raw += t.raw_t[r];
+        for (std::size_t s = 0; s < 3; ++s)
+            for (std::size_t r = 0; r < blur_rows; ++r)
+                if (row_w_[r] != 0.0f) sc.blurred += t.blur_t[s][r];
+        return sc;
+    }
+
+    void blur_term(Trace& t, std::size_t r) const {
+        if (row_w_[r] == 0.0f) return;
+        for (std::size_t s = 0; s < 3; ++s) {
+            const auto& box = t.box[s];
             double acc = 0.0;
             for (std::size_t x = 0; x < width_; ++x) {
-                const auto& e = err_[r * width_ + x];
-                acc += static_cast<double>(color_space::fma_dist_sq(e.L, e.a, e.b));
-            }
-            sc.raw += static_cast<double>(row_w_[r]) * acc;
-        }
-        std::vector<double> pL(width_ + 1), pa(width_ + 1), pb(width_ + 1);
-        for (std::size_t hw : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
-            for (std::size_t r = 0; r < rows_; ++r) {
-                pL[0] = pa[0] = pb[0] = 0.0;
-                for (std::size_t x = 0; x < width_; ++x) {
-                    const auto& e = err_[r * width_ + x];
-                    pL[x + 1] = pL[x] + static_cast<double>(e.L);
-                    pa[x + 1] = pa[x] + static_cast<double>(e.a);
-                    pb[x + 1] = pb[x] + static_cast<double>(e.b);
+                const auto& c = box[r * width_ + x];
+                float L = 2.0f * c.L, a = 2.0f * c.a, b = 2.0f * c.b, tw = 2.0f;
+                if (r > 0) {
+                    const auto& u = box[(r - 1) * width_ + x];
+                    L += u.L;
+                    a += u.a;
+                    b += u.b;
+                    tw += 1.0f;
                 }
+                if (r + 1 < rows_) {
+                    const auto& d = box[(r + 1) * width_ + x];
+                    L += d.L;
+                    a += d.a;
+                    b += d.b;
+                    tw += 1.0f;
+                }
+                acc += static_cast<double>(color_space::fma_dist_sq(L / tw, a / tw, b / tw));
+            }
+            t.blur_t[s][r] = static_cast<double>(row_w_[r]) * acc;
+        }
+    }
+
+    // Dithers rows r0..r1-1 into t from `state` (the state before row r0;
+    // on return the state before r1). Saves the state before each row after
+    // r0 from the first trial row on. With `bound`, returns false as soon as
+    // the partial sums show the trial cannot beat it. Otherwise returns true
+    // and, if r1 is the last row, fills `out`.
+    bool run_into(Trace& t,
+                  Scratch& scratch,
+                  std::size_t r0,
+                  std::size_t r1,
+                  dither::DiffuseState& state,
+                  std::span<const color_space::OKLab> trial,
+                  std::span<const Color3f> trial_s,
+                  const Score* bound,
+                  Score& out) const {
+        auto& err_row = scratch.err_row;
+        std::span<const color_space::OKLab> pal;
+        std::span<const Color3f> pal_s;
+        auto pick = [&](const color_space::OKLab& target,
+                        std::size_t x,
+                        std::size_t r) -> dither::PickResult {
+            std::size_t k = 0;
+            color_space::OKLab chosen{};
+            // The diffuser reads only the chosen colour, so a nearest pick
+            // skips the threshold's second-nearest search.
+            float thr = 0.5f;
+            if (nearest_) {
+                k = dither::nearest_palette_index(target, pal);
+                chosen = pal[k];
+            } else {
+                thr = dither::pick_palette_index_with_ostro(settings_.method,
+                                                            target,
+                                                            pal,
+                                                            x,
+                                                            y0_ + r,
+                                                            settings_.strength,
+                                                            /*k_min=*/0,
+                                                            k,
+                                                            chosen);
+            }
+            const auto& s = all_lab_[y0_ + r][x];
+            err_row[x] = {chosen.L - s.L, chosen.a - s.a, chosen.b - s.b};
+            auto i = r * width_ + x;
+            t.target[i] = target;
+            t.best_d[i] = color_space::fma_dist_sq(
+                target.L - chosen.L, target.a - chosen.a, target.b - chosen.b);
+            t.best_k[i] = static_cast<std::uint8_t>(k);
+            return {chosen, thr, &pal_s[k]};
+        };
+        dither::PixelPicker picker = pick;
+        auto& pL = scratch.pL;
+        auto& pa = scratch.pa;
+        auto& pb = scratch.pb;
+        for (std::size_t row = r0; row < r1; ++row) {
+            if (row >= first_trial_ && row > r0) diffuser_->save(state, row, t.snap[row]);
+            if (uses_trial(row)) {
+                pal = trial;
+                pal_s = trial_s;
+            } else {
+                pal = fixed_[row];
+                pal_s = fixed_s_[row];
+            }
+            diffuser_->row(state, row, picker);
+
+            if (row_w_[row] != 0.0f) {
+                double acc = 0.0;
+                for (std::size_t x = 0; x < width_; ++x) {
+                    const auto& e = err_row[x];
+                    acc += static_cast<double>(color_space::fma_dist_sq(e.L, e.a, e.b));
+                }
+                t.raw_t[row] = static_cast<double>(row_w_[row]) * acc;
+            }
+            pL[0] = pa[0] = pb[0] = 0.0;
+            for (std::size_t x = 0; x < width_; ++x) {
+                const auto& e = err_row[x];
+                pL[x + 1] = pL[x] + static_cast<double>(e.L);
+                pa[x + 1] = pa[x] + static_cast<double>(e.a);
+                pb[x + 1] = pb[x] + static_cast<double>(e.b);
+            }
+            for (std::size_t s = 0; s < 3; ++s) {
+                auto hw = kHalfWidths[s];
+                auto& box = t.box[s];
                 for (std::size_t x = 0; x < width_; ++x) {
                     auto x0 = x >= hw ? x - hw : 0;
                     auto x1 = std::min(width_, x + hw + 1);
                     auto n = static_cast<double>(x1 - x0);
-                    box_[r * width_ + x] = {static_cast<float>((pL[x1] - pL[x0]) / n),
-                                            static_cast<float>((pa[x1] - pa[x0]) / n),
-                                            static_cast<float>((pb[x1] - pb[x0]) / n)};
+                    box[row * width_ + x] = {static_cast<float>((pL[x1] - pL[x0]) / n),
+                                             static_cast<float>((pa[x1] - pa[x0]) / n),
+                                             static_cast<float>((pb[x1] - pb[x0]) / n)};
                 }
             }
-            for (std::size_t r = 0; r < rows_; ++r) {
-                if (row_w_[r] == 0.0f) continue;
-                double acc = 0.0;
-                for (std::size_t x = 0; x < width_; ++x) {
-                    const auto& c = box_[r * width_ + x];
-                    float L = 2.0f * c.L, a = 2.0f * c.a, b = 2.0f * c.b, tw = 2.0f;
-                    if (r > 0) {
-                        const auto& u = box_[(r - 1) * width_ + x];
-                        L += u.L;
-                        a += u.a;
-                        b += u.b;
-                        tw += 1.0f;
-                    }
-                    if (r + 1 < rows_) {
-                        const auto& d = box_[(r + 1) * width_ + x];
-                        L += d.L;
-                        a += d.a;
-                        b += d.b;
-                        tw += 1.0f;
-                    }
-                    acc += static_cast<double>(color_space::fma_dist_sq(L / tw, a / tw, b / tw));
-                }
-                sc.blurred += static_cast<double>(row_w_[r]) * acc;
+            if (row > 0) blur_term(t, row - 1);
+            if (row + 1 == rows_) blur_term(t, row);
+            if (bound) {
+                auto lb = partial(t, row + 1, row + 1 == rows_ ? rows_ : row);
+                if (lb.blurred >= bound->blurred || lb.raw > bound->raw) return false;
             }
         }
-        return sc;
+        if (r1 == rows_) out = partial(t, rows_, rows_);
+        return true;
     }
 
-private:
     const std::vector<std::vector<color_space::OKLab>>& all_lab_;
     const dither::Settings& settings_;
     std::size_t width_;
     std::size_t y_;
     bool lace_;
+    bool nearest_{};
     std::size_t y0_{};
     std::size_t rows_{};
+    std::size_t first_trial_{};
     Image win_;
+    std::optional<dither::DiffuseRows> diffuser_;
     std::vector<float> row_w_;
     std::vector<std::vector<color_space::OKLab>> fixed_;
-    std::vector<color_space::OKLab> err_;
-    std::vector<color_space::OKLab> box_;
+    std::vector<std::vector<Color3f>> fixed_s_;
+    Scratch scratch_;
+    std::vector<color_space::OKLab> inc_pal_;
+    std::vector<Color3f> inc_pal_s_;
+    Trace inc_;
+    Score cur_;       // incumbent score
+    bool pending_{};  // incumbent rows from y on not dithered yet
+    dither::DiffuseState inc_state_;
+    std::size_t ready_{};  // pooled trial buffers sized for this window
 };
 
 }  // namespace
@@ -934,6 +1270,8 @@ Result<CopperResult> encode_copper(const Image& image,
         for (std::size_t x = 0; x < width; ++x)
             all_lab[y][x] = color_space::linear_to_oklab(row[x]);
     }
+    // Source conversions for the DitherWindow scans, built on first use.
+    dither::DiffuseSource window_source;
 
     // Reserve mask: slots the dither pass refuses to pick, AND that the
     // swap planner must pretend don't exist when assigning pixels to
@@ -1157,6 +1495,7 @@ Result<CopperResult> encode_copper(const Image& image,
                 }
             }
             SwapScratch sc;
+            SlotSwapCache slot_cache;
             build_swap_scratch(
                 sc, pal_lab, rows_lab, weights, width, col_weights, planner_excluded);
 
@@ -1185,6 +1524,7 @@ Result<CopperResult> encode_copper(const Image& image,
                 }
                 swapped[slot] = true;
                 current_pal[slot] = color;
+                slot_cache.clear();
                 pal_lab[slot] = color_space::linear_to_oklab(color);
                 if (is_ehb) {
                     pal_lab[num_colors + slot] = color_space::linear_to_oklab(
@@ -1224,28 +1564,22 @@ Result<CopperResult> encode_copper(const Image& image,
                 return lab;
             };
             std::optional<DitherWindow> window;
-            DitherWindow::Score cur_score{};
+            // Per-slot drift cap (see the planner loop below).
+            constexpr float kMaxDriftSq = 0.03f;
+            const std::size_t kTrialBatch = trial_batch();
             if (dither_checked && !is_ehb && num_colors <= kDitherCheckMaxColors &&
                 this_row_changes > 0) {
-                window.emplace(image, all_lab, dither_settings, y, is_lace, resolved_decay);
+                if (window_source.lab.empty()) window_source = dither::diffuse_source(image);
+                window.emplace(
+                    image, all_lab, window_source, dither_settings, y, is_lace, resolved_decay);
                 const auto& other_field = (is_lace && (y & 1)) ? current_pal_f1 : current_pal_f2;
                 for (std::size_t r = 0; r < window->rows(); ++r) {
                     if (window->uses_trial(r)) continue;
                     auto gy = window->row_y(r);
                     window->set_fixed(r, usable_lab(gy < y ? scanline_palettes[gy] : other_field));
                 }
-                cur_score = window->score(usable_lab(current_pal));
+                window->set_incumbent(usable_lab(current_pal));
             }
-            auto improves_dither = [&](std::size_t slot, Color3f color) {
-                if (!window) return true;
-                auto trial = current_pal;
-                trial[slot] = color;
-                auto s = window->score(usable_lab(trial));
-                if (s.blurred >= cur_score.blurred || s.raw > cur_score.raw) return false;
-                cur_score = s;
-                return true;
-            };
-
             // Seed return. Centroid proposals only follow pixels a slot
             // already owns, so a seed colour moved away on some rows never
             // comes back once those rows end (0386: slot 25 holds the sky's
@@ -1288,13 +1622,91 @@ Result<CopperResult> encode_copper(const Image& image,
                     if (gain > 0.0) returns.emplace_back(gain, k);
                 }
                 std::sort(returns.begin(), returns.end(), std::greater<>{});
-                for (auto [gain, k] : returns) {
-                    if (changes.size() >= this_row_changes) break;
-                    if (improves_dither(k, base_pal[k])) apply_change(k, base_pal[k]);
+                // Trials in batches against the same incumbent; the first
+                // kept one is applied and the rest are re-tried after it,
+                // as the one-by-one scan would.
+                std::size_t next = 0;
+                std::vector<std::vector<color_space::OKLab>> trials;
+                while (next < returns.size() && changes.size() < this_row_changes) {
+                    auto nb = std::min(kTrialBatch, returns.size() - next);
+                    trials.clear();
+                    for (std::size_t j = 0; j < nb; ++j) {
+                        auto trial = current_pal;
+                        auto k = returns[next + j].second;
+                        trial[k] = base_pal[k];
+                        trials.push_back(usable_lab(trial));
+                    }
+                    auto hit = window->try_batch(trials);
+                    if (hit < nb) {
+                        auto k = returns[next + hit].second;
+                        apply_change(k, base_pal[k]);
+                    }
+                    next += std::min(nb, hit + 1);
                 }
             }
 
-            while (changes.size() < this_row_changes) {
+            // Dither-checked: plan the next proposals as if every trial
+            // were rejected, score their trials as a batch, then replay
+            // up to the first kept one. Same choices as one at a time.
+            while (window && changes.size() < this_row_changes) {
+                struct Step {
+                    std::size_t slot;
+                    Color3f color;
+                    bool trial;
+                };
+                std::vector<Step> steps;
+                std::vector<std::vector<color_space::OKLab>> trials;
+                auto sw = swapped;
+                bool ended = false;
+                while (trials.size() < kTrialBatch) {
+                    auto swap = find_best_swap(current_pal,
+                                               pal_lab,
+                                               rows,
+                                               rows_lab,
+                                               weights,
+                                               chipset,
+                                               sc,
+                                               sw,
+                                               col_weights,
+                                               {},
+                                               {},
+                                               &slot_cache);
+                    if (swap.error_reduction <= 0.0f) {
+                        ended = true;
+                        break;
+                    }
+                    sw[swap.slot] = true;
+                    // Drift cap and snap-back as in the loop below.
+                    auto base_lab = color_space::linear_to_oklab(base_pal[swap.slot]);
+                    auto new_lab = color_space::linear_to_oklab(swap.new_color);
+                    float ddL = base_lab.L - new_lab.L;
+                    float dda = base_lab.a - new_lab.a;
+                    float ddb = base_lab.b - new_lab.b;
+                    if (color_space::fma_dist_sq(ddL, dda, ddb) > kMaxDriftSq ||
+                        swap.new_color == current_pal[swap.slot]) {
+                        steps.push_back({swap.slot, {}, false});
+                        continue;
+                    }
+                    steps.push_back({swap.slot, swap.new_color, true});
+                    auto trial = current_pal;
+                    trial[swap.slot] = swap.new_color;
+                    trials.push_back(usable_lab(trial));
+                }
+                auto hit = trials.empty() ? std::size_t{0} : window->try_batch(trials);
+                bool kept = false;
+                std::size_t ti = 0;
+                for (const auto& st : steps) {
+                    if (st.trial && ti++ == hit) {
+                        apply_change(st.slot, st.color);
+                        kept = true;
+                        break;
+                    }
+                    swapped[st.slot] = true;
+                }
+                if (!kept && ended) break;
+            }
+
+            while (!window && changes.size() < this_row_changes) {
                 SwapCandidate swap{0, {}, -1.0f};
                 if (is_ehb) {
                     swap = find_best_swap_ehb(
@@ -1328,7 +1740,6 @@ Result<CopperResult> encode_copper(const Image& image,
                 // The cap keeps each slot perceptually within ΔE ~12 of base.
                 // A capped slot is skipped, not the rest of the row: ending
                 // the row here left fantasy1.jpg's later swaps unplanned.
-                constexpr float kMaxDriftSq = 0.03f;
                 auto base_lab = color_space::linear_to_oklab(base_pal[swap.slot]);
                 auto new_lab = color_space::linear_to_oklab(swap.new_color);
                 float ddL = base_lab.L - new_lab.L;
@@ -1336,17 +1747,6 @@ Result<CopperResult> encode_copper(const Image& image,
                 float ddb = base_lab.b - new_lab.b;
                 if (color_space::fma_dist_sq(ddL, dda, ddb) > kMaxDriftSq) {
                     if (is_ehb) break;
-                    swapped[swap.slot] = true;
-                    continue;
-                }
-                // A rejected swap holds the slot for this row. A centroid
-                // that snaps back onto the slot's current colour changes
-                // nothing and is rejected without a trial dither.
-                if (window && swap.new_color == current_pal[swap.slot]) {
-                    swapped[swap.slot] = true;
-                    continue;
-                }
-                if (!improves_dither(swap.slot, swap.new_color)) {
                     swapped[swap.slot] = true;
                     continue;
                 }

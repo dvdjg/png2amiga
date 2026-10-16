@@ -3435,6 +3435,101 @@ bool uses_error_diffusion(Method method) {
            !error_diffusion_kernel(method).empty();
 }
 
+namespace {
+// Nearest entry of palette_lab[k_min..] by the strict-< scan (first index on
+// ties), its distance, and with want_second the second-smallest distance
+// (both capped at FLT_MAX, the scan's starting value).
+std::size_t nearest_scan(const color_space::OKLab& target,
+                         std::span<const color_space::OKLab> palette_lab,
+                         std::size_t k_min,
+                         bool want_second,
+                         float& best_d_out,
+                         float& second_d_out) {
+    float best_d = std::numeric_limits<float>::max();
+    float second_d = std::numeric_limits<float>::max();
+    std::size_t best_k = k_min;
+    const std::size_t n = palette_lab.size();
+    if (n - k_min <= 256 && k_min <= n) {
+        // Same result as the strict-< scan below, without its serial
+        // compare chain: best_d = min (capped at FLT_MAX), best_k = its
+        // first index, second_d = min over the other entries (capped).
+        // Distances are finite here; a non-finite one takes the scan.
+        constexpr std::size_t kLanes = 8;
+        std::array<float, 256 + kLanes> dist;
+        const auto* p = palette_lab.data() + k_min;
+        const std::size_t m = n - k_min;
+        for (std::size_t k = 0; k < m; ++k) {
+            float dL = target.L - p[k].L;
+            float da = target.a - p[k].a;
+            float db = target.b - p[k].b;
+            dist[k] = color_space::fma_dist_sq(dL, da, db);
+        }
+        const std::size_t padded = (m + kLanes - 1) / kLanes * kLanes;
+        for (std::size_t k = m; k < padded; ++k)
+            dist[k] = std::numeric_limits<float>::max();
+        auto min_of = [&]() {
+            std::array<float, kLanes> acc;
+            acc.fill(std::numeric_limits<float>::max());
+            for (std::size_t k = 0; k < padded; k += kLanes)
+                for (std::size_t j = 0; j < kLanes; ++j)
+                    acc[j] = dist[k + j] < acc[j] ? dist[k + j] : acc[j];
+            float r = acc[0];
+            for (std::size_t j = 1; j < kLanes; ++j)
+                r = acc[j] < r ? acc[j] : r;
+            return r;
+        };
+        const float mn = min_of();
+        std::size_t rel = 0;
+        while (rel < m && !(dist[rel] == mn))
+            ++rel;
+        if (rel < m && mn < std::numeric_limits<float>::max()) {
+            best_d = mn;
+            best_k = k_min + rel;
+            if (want_second) {
+                dist[rel] = std::numeric_limits<float>::max();
+                second_d = min_of();
+            }
+        } else {
+            for (std::size_t k = 0; k < m; ++k) {
+                float d = dist[k];
+                if (d < best_d) {
+                    second_d = best_d;
+                    best_d = d;
+                    best_k = k_min + k;
+                } else if (d < second_d) {
+                    second_d = d;
+                }
+            }
+        }
+    } else {
+        for (std::size_t k = k_min; k < n; ++k) {
+            float dL = target.L - palette_lab[k].L;
+            float da = target.a - palette_lab[k].a;
+            float db = target.b - palette_lab[k].b;
+            float d = color_space::fma_dist_sq(dL, da, db);
+            if (d < best_d) {
+                second_d = best_d;
+                best_d = d;
+                best_k = k;
+            } else if (d < second_d) {
+                second_d = d;
+            }
+        }
+    }
+    best_d_out = best_d;
+    second_d_out = second_d;
+    return best_k;
+}
+}  // namespace
+
+std::size_t nearest_palette_index(const color_space::OKLab& target,
+                                  std::span<const color_space::OKLab> palette_lab,
+                                  std::size_t k_min) {
+    float best_d = 0.0f;
+    float second_d = 0.0f;
+    return nearest_scan(target, palette_lab, k_min, false, best_d, second_d);
+}
+
 float pick_palette_index_with_ostro(Method method,
                                     const color_space::OKLab& target,
                                     std::span<const color_space::OKLab> palette_lab,
@@ -3457,22 +3552,9 @@ float pick_palette_index_with_ostro(Method method,
         return 0.5f;  // yliluoma → unit ostromoukhov scale
     }
 
-    float best_d = std::numeric_limits<float>::max();
-    float second_d = std::numeric_limits<float>::max();
-    std::size_t best_k = k_min;
-    for (std::size_t k = k_min; k < palette_lab.size(); ++k) {
-        float dL = target.L - palette_lab[k].L;
-        float da = target.a - palette_lab[k].a;
-        float db = target.b - palette_lab[k].b;
-        float d = color_space::fma_dist_sq(dL, da, db);
-        if (d < best_d) {
-            second_d = best_d;
-            best_d = d;
-            best_k = k;
-        } else if (d < second_d) {
-            second_d = d;
-        }
-    }
+    float best_d = 0.0f;
+    float second_d = 0.0f;
+    std::size_t best_k = nearest_scan(target, palette_lab, k_min, true, best_d, second_d);
     chosen_index = best_k;
     chosen_lab = palette_lab[best_k];
     if (second_d > 1e-12f) {
@@ -3551,39 +3633,63 @@ float diffuse_cells_mirrored(const Image& image,
     return total;
 }
 
-float diffuse_raw_buffer(const Image& image, const Settings& settings, const PixelPicker& pick) {
-    auto w = image.width();
-    auto h = image.height();
+DiffuseSource diffuse_source(const Image& image) {
+    DiffuseSource src;
+    const auto w = image.width();
+    const auto h = image.height();
+    src.width = w;
+    src.lab.resize(w * h);
+    src.srgb.resize(w * h);
+    for (std::size_t y = 0; y < h; ++y) {
+        for (std::size_t x = 0; x < w; ++x) {
+            Color3f src_lin = image[x, y];
+            src.lab[y * w + x] = color_space::linear_to_oklab(src_lin);
+            src.srgb[y * w + x] = color_space::linear_to_srgb(src_lin).clamped();
+        }
+    }
+    return src;
+}
 
-    bool is_ord = is_ordered(settings.method) && settings.method != Method::none;
-    auto kernel = error_diffusion_kernel(settings.method);
-    bool is_diff = settings.method != Method::none && !is_ord && !kernel.empty();
-    bool needs_riem = is_diff && needs_riemersma_queue(settings.method);
+DiffuseRows::DiffuseRows(const Image& image,
+                         const Settings& settings,
+                         const DiffuseSource* source,
+                         std::size_t first_row)
+    : image_(&image), settings_(&settings), w_(image.width()), h_(image.height()) {
+    is_ord_ = is_ordered(settings.method) && settings.method != Method::none;
+    kernel_ = error_diffusion_kernel(settings.method);
+    is_diff_ = settings.method != Method::none && !is_ord_ && !kernel_.empty();
+    needs_riem_ = is_diff_ && needs_riemersma_queue(settings.method);
     // v1 coupled-OKLab residual: qe is one perceptual 3-vector, accumulator
     // lives in OKLab not sRGB. Picker contract is unchanged.
-    bool is_oklab = settings.method == Method::floyd_steinberg_oklab;
+    is_oklab_ = settings.method == Method::floyd_steinberg_oklab;
 
-    auto bias_map = (is_diff && !is_oklab)
-                        ? compute_structure_bias(image, settings.method)
-                        : std::vector<float>{};
+    if (is_diff_ && !is_oklab_) bias_map_ = compute_structure_bias(image, settings.method);
+    for (const auto& e : kernel_)
+        reach_ = std::max(reach_, static_cast<std::size_t>(std::max(e.dy, 0)));
 
-    constexpr std::size_t RIEM_QSIZE = 16;
-    std::array<float, RIEM_QSIZE> riem_weights{};
-    std::size_t riem_head = 0;
-    if (needs_riem) {
+    if (needs_riem_) {
         const float ratio = std::pow(1.0f / 16.0f, 1.0f / 15.0f);
         float w_acc = 1.0f;
-        for (std::size_t i = RIEM_QSIZE; i-- > 0;) {
-            riem_weights[i] = w_acc;
+        for (std::size_t i = kRiemQueue; i-- > 0;) {
+            riem_weights_[i] = w_acc;
             w_acc *= ratio;
         }
         float total = 0.0f;
-        for (float wt : riem_weights)
+        for (float wt : riem_weights_)
             total += wt;
-        for (float& wt : riem_weights)
+        for (float& wt : riem_weights_)
             wt /= total;
     }
 
+    if (source && source->width == w_ && source->lab.size() >= (first_row + h_) * w_ &&
+        source->srgb.size() >= (first_row + h_) * w_) {
+        src_lab_ = source->lab.data() + first_row * w_;
+        src_s_ = source->srgb.data() + first_row * w_;
+    }
+}
+
+DiffuseState DiffuseRows::start() const {
+    DiffuseState st;
     // Error diffusion in sRGB (gamma-encoded) space. Picker still
     // chooses perceptually (OKLab), but residual conservation runs
     // in sRGB because the gamma curve happens to allocate
@@ -3593,19 +3699,73 @@ float diffuse_raw_buffer(const Image& image, const Settings& settings, const Pix
     // This is what ham_convert / abc / ham_convert.jar do; it's the
     // structural difference behind their stronger-looking ED on
     // low-bit-depth output (EHB / OCS16).
-    std::vector<Color3f> err_buf_s;
-    if (is_diff && !is_oklab) err_buf_s.assign(w * h, Color3f{0, 0, 0});
-    std::array<Color3f, RIEM_QSIZE> riem_queue_s{};
-
+    if (is_diff_ && !is_oklab_) st.err_s.assign(w_ * h_, Color3f{0, 0, 0});
     // Experimental path: OKLab accumulator (L, a, b stored per pixel).
     // Per-axis ec_ab is half of ec_L because a/b have ~half the typical
     // range of L in display-content OKLab. Both still scalar-tunable via
     // the same --error-clamp knob for now; will split if blow-ups warrant.
-    std::vector<color_space::OKLab> err_buf_lab;
-    if (is_diff && is_oklab)
-        err_buf_lab.assign(w * h, color_space::OKLab{0.0f, 0.0f, 0.0f});
+    if (is_diff_ && is_oklab_) st.err_lab.assign(w_ * h_, color_space::OKLab{0.0f, 0.0f, 0.0f});
+    return st;
+}
 
-    float total_error = 0.0f;
+namespace {
+template<class T>
+void save_rows(const std::vector<T>& src, std::size_t lo, std::size_t hi, std::vector<T>& out) {
+    if (src.empty()) {
+        out.clear();
+        return;
+    }
+    out.assign(src.begin() + static_cast<std::ptrdiff_t>(lo),
+               src.begin() + static_cast<std::ptrdiff_t>(hi));
+}
+template<class T>
+void restore_rows(const std::vector<T>& saved, std::size_t lo, std::size_t n, std::vector<T>& st) {
+    st.resize(n);
+    std::copy(saved.begin(), saved.end(), st.begin() + static_cast<std::ptrdiff_t>(lo));
+    std::fill(st.begin() + static_cast<std::ptrdiff_t>(lo + saved.size()), st.end(), T{});
+}
+}  // namespace
+
+void DiffuseRows::save(const DiffuseState& st, std::size_t y, DiffuseState& out) const {
+    const auto lo = std::min(y, h_) * w_;
+    const auto hi = std::min(y + reach_, h_) * w_;
+    save_rows(st.err_s, lo, hi, out.err_s);
+    save_rows(st.err_lab, lo, hi, out.err_lab);
+    out.riem_queue = st.riem_queue;
+    out.riem_head = st.riem_head;
+    out.total_error = st.total_error;
+}
+
+void DiffuseRows::restore(const DiffuseState& saved, std::size_t y, DiffuseState& st) const {
+    const auto lo = std::min(y, h_) * w_;
+    if (is_diff_ && !is_oklab_)
+        restore_rows(saved.err_s, lo, w_ * h_, st.err_s);
+    else
+        st.err_s.clear();
+    if (is_diff_ && is_oklab_)
+        restore_rows(saved.err_lab, lo, w_ * h_, st.err_lab);
+    else
+        st.err_lab.clear();
+    st.riem_queue = saved.riem_queue;
+    st.riem_head = saved.riem_head;
+    st.total_error = saved.total_error;
+}
+
+void DiffuseRows::row(DiffuseState& st, std::size_t y, const PixelPicker& pick) const {
+    const auto& image = *image_;
+    const auto& settings = *settings_;
+    const auto w = w_;
+    const auto h = h_;
+    const bool is_ord = is_ord_;
+    const bool is_diff = is_diff_;
+    const bool needs_riem = needs_riem_;
+    const bool is_oklab = is_oklab_;
+    const bool cached = src_lab_ != nullptr;
+    auto& err_buf_s = st.err_s;
+    auto& err_buf_lab = st.err_lab;
+    auto& riem_queue_s = st.riem_queue;
+    auto& riem_head = st.riem_head;
+
     auto ec = settings.error_clamp;
     // OKLab accumulator: L axis uses ec as-is; a/b halved because their
     // typical range is half of L's. A 5×4 sweep (ec_L ∈ {0.20..0.60},
@@ -3615,120 +3775,130 @@ float diffuse_raw_buffer(const Image& image, const Settings& settings, const Pix
     auto ec_L = ec;
     auto ec_ab = ec * 0.5f;
 
-    for (std::size_t y = 0; y < h; ++y) {
-        bool reverse = is_diff && settings.serpentine && (y & 1);
-        // Hoist serpentine direction sign out of the kernel loop below.
-        const int dir = reverse ? -1 : 1;
+    bool reverse = is_diff && settings.serpentine && (y & 1);
+    // Hoist serpentine direction sign out of the kernel loop below.
+    const int dir = reverse ? -1 : 1;
 
-        for (std::size_t step = 0; step < w; ++step) {
-            std::size_t x = reverse ? (w - 1 - step) : step;
-            Color3f src_lin = image[x, y];
-            auto src_lab = color_space::linear_to_oklab(src_lin);
+    for (std::size_t step = 0; step < w; ++step) {
+        std::size_t x = reverse ? (w - 1 - step) : step;
+        Color3f src_lin = image[x, y];
+        auto src_lab = cached ? src_lab_[y * w + x] : color_space::linear_to_oklab(src_lin);
 
-            color_space::OKLab target{};
-            Color3f target_s{0.0f, 0.0f, 0.0f};
+        color_space::OKLab target{};
+        Color3f target_s{0.0f, 0.0f, 0.0f};
 
+        if (is_oklab) {
+            // Coupled-OKLab residual: read accumulated perceptual
+            // error directly into the picker's space, no sRGB
+            // round-trip. ec is split per-axis.
+            target = src_lab;
+            if (is_diff) {
+                auto& e = err_buf_lab[y * w + x];
+                target.L += std::clamp(e.L, -ec_L, ec_L);
+                target.a += std::clamp(e.a, -ec_ab, ec_ab);
+                target.b += std::clamp(e.b, -ec_ab, ec_ab);
+            }
+        } else {
+            Color3f src_s = cached ? src_s_[y * w + x]
+                                   : color_space::linear_to_srgb(src_lin).clamped();
+            target_s = src_s;
+            if (needs_riem) {
+                Color3f carry{0, 0, 0};
+                for (std::size_t k = 0; k < kRiemQueue; ++k) {
+                    std::size_t age = (riem_head + kRiemQueue - 1 - k) % kRiemQueue;
+                    carry.r += riem_queue_s[age].r * riem_weights_[k];
+                    carry.g += riem_queue_s[age].g * riem_weights_[k];
+                    carry.b += riem_queue_s[age].b * riem_weights_[k];
+                }
+                target_s.r += std::clamp(carry.r, -ec, ec);
+                target_s.g += std::clamp(carry.g, -ec, ec);
+                target_s.b += std::clamp(carry.b, -ec, ec);
+            } else if (is_diff) {
+                auto& e = err_buf_s[y * w + x];
+                target_s.r += std::clamp(e.r, -ec, ec);
+                target_s.g += std::clamp(e.g, -ec, ec);
+                target_s.b += std::clamp(e.b, -ec, ec);
+            }
+            // Round-trip target back to OKLab via linear so the
+            // picker keeps using a perceptual nearest-search.
+            Color3f target_lin = color_space::srgb_to_linear(target_s);
+            target = color_space::linear_to_oklab(target_lin);
+            if (!bias_map_.empty()) target.L += bias_map_[y * w + x];
+            if (is_ord) {
+                float thr = ordered_threshold(settings.method, x, y);
+                target.L += thr * settings.strength * 0.15f;
+                target.a += thr * settings.strength * 0.03f;
+                target.b += thr * settings.strength * 0.03f;
+            }
+        }
+
+        auto picked = pick(target, x, y);
+
+        float dL = src_lab.L - picked.chosen_lab.L;
+        float da = src_lab.a - picked.chosen_lab.a;
+        float db = src_lab.b - picked.chosen_lab.b;
+        st.total_error += color_space::fma_dist_sq(dL, da, db);
+
+        if (is_diff) {
             if (is_oklab) {
-                // Coupled-OKLab residual: read accumulated perceptual
-                // error directly into the picker's space, no sRGB
-                // round-trip. ec is split per-axis.
-                target = src_lab;
-                if (is_diff) {
-                    auto& e = err_buf_lab[y * w + x];
-                    target.L += std::clamp(e.L, -ec_L, ec_L);
-                    target.a += std::clamp(e.a, -ec_ab, ec_ab);
-                    target.b += std::clamp(e.b, -ec_ab, ec_ab);
+                // qe = (target − chosen) — leftover residual, matching
+                // the sRGB path's semantics, just in OKLab.
+                float qe_L = (target.L - picked.chosen_lab.L) * settings.strength;
+                float qe_a = (target.a - picked.chosen_lab.a) * settings.strength;
+                float qe_b = (target.b - picked.chosen_lab.b) * settings.strength;
+                for (auto& [kdx, kdy, kw] : kernel_) {
+                    auto nx = static_cast<std::ptrdiff_t>(x) + kdx * dir;
+                    auto ny = static_cast<std::ptrdiff_t>(y) + kdy;
+                    if (nx < 0 || ny < 0) continue;
+                    if (static_cast<std::size_t>(nx) >= w) continue;
+                    if (static_cast<std::size_t>(ny) >= h) continue;
+                    auto& en = err_buf_lab[static_cast<std::size_t>(ny) * w +
+                                           static_cast<std::size_t>(nx)];
+                    en.L += qe_L * kw;
+                    en.a += qe_a * kw;
+                    en.b += qe_b * kw;
                 }
             } else {
-                Color3f src_s = color_space::linear_to_srgb(src_lin).clamped();
-                target_s = src_s;
+                Color3f chosen_s;
+                if (picked.chosen_srgb) {
+                    chosen_s = *picked.chosen_srgb;
+                } else {
+                    Color3f chosen_lin = color_space::oklab_to_linear(picked.chosen_lab);
+                    chosen_s = color_space::linear_to_srgb(chosen_lin).clamped();
+                }
+                Color3f qe_s{
+                    (target_s.r - chosen_s.r) * settings.strength,
+                    (target_s.g - chosen_s.g) * settings.strength,
+                    (target_s.b - chosen_s.b) * settings.strength,
+                };
                 if (needs_riem) {
-                    Color3f carry{0, 0, 0};
-                    for (std::size_t k = 0; k < RIEM_QSIZE; ++k) {
-                        std::size_t age = (riem_head + RIEM_QSIZE - 1 - k) % RIEM_QSIZE;
-                        carry.r += riem_queue_s[age].r * riem_weights[k];
-                        carry.g += riem_queue_s[age].g * riem_weights[k];
-                        carry.b += riem_queue_s[age].b * riem_weights[k];
-                    }
-                    target_s.r += std::clamp(carry.r, -ec, ec);
-                    target_s.g += std::clamp(carry.g, -ec, ec);
-                    target_s.b += std::clamp(carry.b, -ec, ec);
-                } else if (is_diff) {
-                    auto& e = err_buf_s[y * w + x];
-                    target_s.r += std::clamp(e.r, -ec, ec);
-                    target_s.g += std::clamp(e.g, -ec, ec);
-                    target_s.b += std::clamp(e.b, -ec, ec);
-                }
-                // Round-trip target back to OKLab via linear so the
-                // picker keeps using a perceptual nearest-search.
-                Color3f target_lin = color_space::srgb_to_linear(target_s);
-                target = color_space::linear_to_oklab(target_lin);
-                if (!bias_map.empty()) target.L += bias_map[y * w + x];
-                if (is_ord) {
-                    float thr = ordered_threshold(settings.method, x, y);
-                    target.L += thr * settings.strength * 0.15f;
-                    target.a += thr * settings.strength * 0.03f;
-                    target.b += thr * settings.strength * 0.03f;
-                }
-            }
-
-            auto picked = pick(target, x, y);
-
-            float dL = src_lab.L - picked.chosen_lab.L;
-            float da = src_lab.a - picked.chosen_lab.a;
-            float db = src_lab.b - picked.chosen_lab.b;
-            total_error += color_space::fma_dist_sq(dL, da, db);
-
-            if (is_diff) {
-                if (is_oklab) {
-                    // qe = (target − chosen) — leftover residual, matching
-                    // the sRGB path's semantics, just in OKLab.
-                    float qe_L = (target.L - picked.chosen_lab.L) * settings.strength;
-                    float qe_a = (target.a - picked.chosen_lab.a) * settings.strength;
-                    float qe_b = (target.b - picked.chosen_lab.b) * settings.strength;
-                    for (auto& [kdx, kdy, kw] : kernel) {
+                    riem_queue_s[riem_head] = qe_s;
+                    riem_head = (riem_head + 1) % kRiemQueue;
+                } else {
+                    for (auto& [kdx, kdy, kw] : kernel_) {
                         auto nx = static_cast<std::ptrdiff_t>(x) + kdx * dir;
                         auto ny = static_cast<std::ptrdiff_t>(y) + kdy;
                         if (nx < 0 || ny < 0) continue;
                         if (static_cast<std::size_t>(nx) >= w) continue;
                         if (static_cast<std::size_t>(ny) >= h) continue;
-                        auto& en = err_buf_lab[static_cast<std::size_t>(ny) * w +
-                                               static_cast<std::size_t>(nx)];
-                        en.L += qe_L * kw;
-                        en.a += qe_a * kw;
-                        en.b += qe_b * kw;
-                    }
-                } else {
-                    Color3f chosen_lin = color_space::oklab_to_linear(picked.chosen_lab);
-                    Color3f chosen_s = color_space::linear_to_srgb(chosen_lin).clamped();
-                    Color3f qe_s{
-                        (target_s.r - chosen_s.r) * settings.strength,
-                        (target_s.g - chosen_s.g) * settings.strength,
-                        (target_s.b - chosen_s.b) * settings.strength,
-                    };
-                    if (needs_riem) {
-                        riem_queue_s[riem_head] = qe_s;
-                        riem_head = (riem_head + 1) % RIEM_QSIZE;
-                    } else {
-                        for (auto& [kdx, kdy, kw] : kernel) {
-                            auto nx = static_cast<std::ptrdiff_t>(x) + kdx * dir;
-                            auto ny = static_cast<std::ptrdiff_t>(y) + kdy;
-                            if (nx < 0 || ny < 0) continue;
-                            if (static_cast<std::size_t>(nx) >= w) continue;
-                            if (static_cast<std::size_t>(ny) >= h) continue;
-                            auto& en = err_buf_s[static_cast<std::size_t>(ny) * w +
-                                                 static_cast<std::size_t>(nx)];
-                            en.r += qe_s.r * kw;
-                            en.g += qe_s.g * kw;
-                            en.b += qe_s.b * kw;
-                        }
+                        auto& en = err_buf_s[static_cast<std::size_t>(ny) * w +
+                                             static_cast<std::size_t>(nx)];
+                        en.r += qe_s.r * kw;
+                        en.g += qe_s.g * kw;
+                        en.b += qe_s.b * kw;
                     }
                 }
             }
         }
     }
+}
 
-    return total_error;
+float diffuse_raw_buffer(const Image& image, const Settings& settings, const PixelPicker& pick) {
+    DiffuseRows rows(image, settings);
+    auto st = rows.start();
+    for (std::size_t y = 0; y < image.height(); ++y)
+        rows.row(st, y, pick);
+    return st.total_error;
 }
 
 float ordered_threshold(Method method, std::size_t x, std::size_t y) {
