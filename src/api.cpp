@@ -839,8 +839,12 @@ struct PlainAutoTrial {
     bitplane::BitplaneData planes;
     Image rendered;
     float total_error;
+    dither::Settings dith;  // the settings this trial was dithered with
 };
 
+// `start`: re-encode that trial's palette (and locked mask) instead of
+// quantizing — skips quantize, match_range and refine_with_dither; the
+// dither, pair fitting and tail run as usual.
 Result<PlainAutoTrial> encode_plain_auto(const Image& img,
                                          std::size_t depth,
                                          std::size_t max_colors,
@@ -857,7 +861,8 @@ Result<PlainAutoTrial> encode_plain_auto(const Image& img,
                                          const std::vector<ReserveSpec>& reserves,
                                          const std::vector<PinSpec>& pins,
                                          const std::vector<bool>& tmask,
-                                         bool fit_pairs = false) {
+                                         bool fit_pairs = false,
+                                         const PlainAutoTrial* start = nullptr) {
     // Atari uses the full palette (no border slot tied to index 0).
     bool is_atari_local = amiga::is_atari(mode);
     bool lock_zero = lock_color0 && (has_transparency || !is_atari_local);
@@ -915,54 +920,62 @@ Result<PlainAutoTrial> encode_plain_auto(const Image& img,
         if (r.index >= 0 && i < max_colors) reserved_mask[i] = true;
     }
 
-    // Quantize + assemble. EGA modes (ega-hi specifically — the 200-line
-    // ega_320/640 use kCgaHw and take a separate non-auto path at the
-    // call site) go through ega_histogram on a pre-snapped image.
-    auto qc = palette_locks::quant_counts_for_assemble(max_colors, locks, reserve_count, lock_zero);
-    Image ega_snapped;
-    const bool is_ega_mode = amiga::is_ega(mode);
-    if (is_ega_mode) {
-        ega_snapped = Image(img.width(), img.height());
-        for (std::size_t y = 0; y < img.height(); ++y)
-            for (std::size_t x = 0; x < img.width(); ++x)
-                ega_snapped[x, y] = palette::quantize_to_ega(img[x, y]);
-    }
-    auto qfn = [&](std::size_t k) -> Result<Palette> {
-        if (is_ega_mode) return quantize::ega_histogram(ega_snapped, k);
-        return quantize::quantize(img, k, quantize_algo(chipset, mode), palette_diversity);
-    };
-    auto quantized = palette_locks::two_pass_quantize(qfn, qc.qcount, qc.kfallback, lock_zero);
-    if (!quantized) return std::unexpected{quantized.error()};
-    if (amiga::is_stf(mode) || amiga::is_vga(mode)) snap_to_chipset(*quantized, chipset, mode);
-    auto assembled = palette_locks::assemble_with_reserves(
-        *quantized, locks, reserves, max_colors, lock_zero, chipset, mode);
-
     PlainAutoTrial out;
-    out.pal = std::move(assembled.palette);
-    out.locked_mask = std::move(assembled.locked);
-    out.pal_size = std::min(out.pal.size(), max_colors);
+    out.dith = dith;
+    if (start) {
+        out.pal = start->pal;
+        out.locked_mask = start->locked_mask;
+        out.pal_size = start->pal_size;
+    } else {
+        // Quantize + assemble. EGA modes (ega-hi specifically — the 200-line
+        // ega_320/640 use kCgaHw and take a separate non-auto path at the
+        // call site) go through ega_histogram on a pre-snapped image.
+        auto qc = palette_locks::quant_counts_for_assemble(
+            max_colors, locks, reserve_count, lock_zero);
+        Image ega_snapped;
+        const bool is_ega_mode = amiga::is_ega(mode);
+        if (is_ega_mode) {
+            ega_snapped = Image(img.width(), img.height());
+            for (std::size_t y = 0; y < img.height(); ++y)
+                for (std::size_t x = 0; x < img.width(); ++x)
+                    ega_snapped[x, y] = palette::quantize_to_ega(img[x, y]);
+        }
+        auto qfn = [&](std::size_t k) -> Result<Palette> {
+            if (is_ega_mode) return quantize::ega_histogram(ega_snapped, k);
+            return quantize::quantize(img, k, quantize_algo(chipset, mode), palette_diversity);
+        };
+        auto quantized = palette_locks::two_pass_quantize(qfn, qc.qcount, qc.kfallback, lock_zero);
+        if (!quantized) return std::unexpected{quantized.error()};
+        if (amiga::is_stf(mode) || amiga::is_vga(mode)) snap_to_chipset(*quantized, chipset, mode);
+        auto assembled = palette_locks::assemble_with_reserves(
+            *quantized, locks, reserves, max_colors, lock_zero, chipset, mode);
 
-    if (match_range) preprocess::match_palette_range(const_cast<Image&>(img), out.pal);
+        out.pal = std::move(assembled.palette);
+        out.locked_mask = std::move(assembled.locked);
+        out.pal_size = std::min(out.pal.size(), max_colors);
 
-    // Dither-aware refinement (auto-palette only). Same gates as the
-    // pre-extraction non-best path. The locked_mask flow keeps slot 0
-    // (when lock_color0 is true) at pure black across iterations.
-    if (refine_iterations > 0 && dith.method != dither::Method::none && reserve_count == 0 &&
-        !amiga::is_cga(mode) && !amiga::is_chunky(mode) && !amiga::is_ega(mode) &&
-        !amiga::is_atari_hi(mode)) {
-        auto refined = quantize::refine_with_dither(
-            img,
-            Palette{"refined",
-                    {out.pal.colors.begin(),
-                     out.pal.colors.begin() + static_cast<std::ptrdiff_t>(out.pal_size)}},
-            dith,
-            chipset,
-            mode,
-            static_cast<std::size_t>(refine_iterations),
-            out.locked_mask);
-        if (refined) {
-            out.pal.colors = std::move(refined->colors);
-            out.pal_size = out.pal.colors.size();
+        if (match_range) preprocess::match_palette_range(const_cast<Image&>(img), out.pal);
+
+        // Dither-aware refinement (auto-palette only). Same gates as the
+        // pre-extraction non-best path. The locked_mask flow keeps slot 0
+        // (when lock_color0 is true) at pure black across iterations.
+        if (refine_iterations > 0 && dith.method != dither::Method::none && reserve_count == 0 &&
+            !amiga::is_cga(mode) && !amiga::is_chunky(mode) && !amiga::is_ega(mode) &&
+            !amiga::is_atari_hi(mode)) {
+            auto refined = quantize::refine_with_dither(
+                img,
+                Palette{"refined",
+                        {out.pal.colors.begin(),
+                         out.pal.colors.begin() + static_cast<std::ptrdiff_t>(out.pal_size)}},
+                dith,
+                chipset,
+                mode,
+                static_cast<std::size_t>(refine_iterations),
+                out.locked_mask);
+            if (refined) {
+                out.pal.colors = std::move(refined->colors);
+                out.pal_size = out.pal.colors.size();
+            }
         }
     }
 
@@ -3436,6 +3449,11 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         // applies the pin swap per trial — visual no-op so ranking
         // isn't affected. User palettes still exclude the sweep.
         bool ehb_can_sweep = options.best && !has_user_palette(options);
+        // AGA EHB --best: the sweep trials dither differently from plain
+        // (dither::apply vs diffuse_raw_buffer, no half-brite dedupe), so
+        // the sweep result is held here and the plain encode below is
+        // kept instead when it scores higher.
+        std::optional<PipelineResult> ehb_sweep_result;
 
         // EHB pop-search path. Same eligibility as the legacy sweep; we
         // gate on chipset==OCS because pop_search.cpp's snap-OCS step
@@ -3696,7 +3714,8 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             result.has_transparency = has_transparency;
             result.transparency_mask = tmask;
             result.finalize_psnr(*image, winner->total_error);
-            return result;
+            if (chipset != amiga::Chipset::aga || tile_active) return result;
+            ehb_sweep_result = std::move(result);
         }
 
         // Generate base colors via median-cut, or load from file.
@@ -4001,6 +4020,14 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 if (tmask[i]) result.rendered.pixels()[i] = Color3f{0, 0, 0};
         }
         result.finalize_psnr(*image, dither_result.total_error);
+        if (ehb_sweep_result) {
+            auto s2 = [&](const Image& r) {
+                return ssimulacra2::compute(
+                    image->pixels(), r.pixels(), image->width(), image->height());
+            };
+            if (s2(ehb_sweep_result->rendered) >= s2(result.rendered))
+                return *std::move(ehb_sweep_result);
+        }
         if (tile_active) {
             auto cropped = tile_crop_result(
                 result, tile_w, tile_h, depth, bitplane::Layout::interleaved);
@@ -4673,6 +4700,56 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         // sweep adds 7-10 s of wall on top of pop. Skip the sweep
         // entirely; pop search self-seeds via internal k-means
         // diversity restarts.
+        // Score helper — masks transparent pixels to black on
+        // both sides so SSIMULACRA2 doesn't penalise the ignored
+        // regions (matches cpu_fitness's masking).
+        auto score_rendered = [&](const Image& rnd) -> float {
+            if (!has_transparency) {
+                return ssimulacra2::compute(
+                    image->pixels(), rnd.pixels(), image->width(), image->height());
+            }
+            Image src_m(image->width(), image->height());
+            Image rnd_m(image->width(), image->height());
+            auto sp = src_m.pixels();
+            auto rp = rnd_m.pixels();
+            auto op = image->pixels();
+            auto orp = rnd.pixels();
+            for (std::size_t i = 0; i < sp.size(); ++i) {
+                if (i < tmask.size() && tmask[i]) {
+                    sp[i] = Color3f{0, 0, 0};
+                    rp[i] = Color3f{0, 0, 0};
+                } else {
+                    sp[i] = op[i];
+                    rp[i] = orp[i];
+                }
+            }
+            return ssimulacra2::compute(
+                src_m.pixels(), rnd_m.pixels(), image->width(), image->height());
+        };
+
+        // Plain's own encode (with pair fitting): a candidate in both
+        // pickers below, so --best never scores below the non-best output.
+        auto encode_plain_candidate = [&](const dither::Settings& d, const PlainAutoTrial* start) {
+            return encode_plain_auto(*image,
+                                     depth,
+                                     max_colors,
+                                     mode,
+                                     chipset,
+                                     d,
+                                     options.palette_diversity,
+                                     options.refine_iterations,
+                                     options.lock_color0,
+                                     has_transparency,
+                                     /*use_dpf=*/false,
+                                     /*match_range=*/options.match_range,
+                                     options.locks,
+                                     options.reserves,
+                                     options.pins,
+                                     tmask,
+                                     /*fit_pairs=*/true,
+                                     start);
+        };
+
         const auto& mp_curr = amiga::get_mode_params(mode);
         bool pop_only = chipset == amiga::Chipset::ocs && !mp_curr.is_hires && depth >= 1 &&
                         depth <= 5;
@@ -4836,38 +4913,13 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 sweep_phase_progress,
                 /*jitter_amplitude=*/1.0f);
 
-            // Score helper — masks transparent pixels to black on
-            // both sides so SSIMULACRA2 doesn't penalise the ignored
-            // regions (matches cpu_fitness's masking).
-            auto score_rendered = [&](const Image& rnd) -> float {
-                if (!has_transparency) {
-                    return ssimulacra2::compute(
-                        image->pixels(), rnd.pixels(), image->width(), image->height());
-                }
-                Image src_m(image->width(), image->height());
-                Image rnd_m(image->width(), image->height());
-                auto sp = src_m.pixels();
-                auto rp = rnd_m.pixels();
-                auto op = image->pixels();
-                auto orp = rnd.pixels();
-                for (std::size_t i = 0; i < sp.size(); ++i) {
-                    if (i < tmask.size() && tmask[i]) {
-                        sp[i] = Color3f{0, 0, 0};
-                        rp[i] = Color3f{0, 0, 0};
-                    } else {
-                        sp[i] = op[i];
-                        rp[i] = orp[i];
-                    }
-                }
-                return ssimulacra2::compute(
-                    src_m.pixels(), rnd_m.pixels(), image->width(), image->height());
-            };
-
-            // 3-way candidate ranking: pop / seed / sweep. seed_keep is
-            // only present when locks/reserves/transparency are in
-            // play (otherwise pop_search's internal k-means seeding
-            // suffices). Pick the highest-scoring candidate.
-            enum Kind { K_POP, K_SEED, K_SWEEP };
+            // 4-way candidate ranking: pop / seed / sweep / plain.
+            // seed_keep is only present when locks/reserves/transparency
+            // are in play (otherwise pop_search's internal k-means seeding
+            // suffices). Pick the highest-scoring candidate; ties keep
+            // the earlier one.
+            auto plain = encode_plain_candidate(base_dith, nullptr);
+            enum Kind { K_POP, K_SEED, K_SWEEP, K_PLAIN };
             struct Cand {
                 float s2;
                 Kind kind;
@@ -4876,6 +4928,7 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             if (pop) cands.push_back({score_rendered(pop->rendered), K_POP});
             if (seed_keep) cands.push_back({score_rendered(seed_keep->rendered), K_SEED});
             if (sweep) cands.push_back({score_rendered(sweep->rendered), K_SWEEP});
+            if (plain) cands.push_back({score_rendered(plain->rendered), K_PLAIN});
 
             if (!cands.empty()) {
                 auto win = std::max_element(
@@ -4902,15 +4955,16 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                     result.palette = std::move(pal_keep);
                     result.indices = std::move(seed_keep->indices);
                     result.finalize_psnr(*image, seed_keep->total_error);
-                } else {  // K_SWEEP
-                    std::vector<Color3f> pal_keep(sweep->pal.colors.begin(),
-                                                  sweep->pal.colors.begin() +
-                                                      static_cast<std::ptrdiff_t>(sweep->pal_size));
-                    result.rendered = std::move(sweep->rendered);
-                    result.planes = std::move(sweep->planes);
+                } else {  // K_SWEEP / K_PLAIN
+                    auto& t = win->kind == K_SWEEP ? *sweep : *plain;
+                    std::vector<Color3f> pal_keep(t.pal.colors.begin(),
+                                                  t.pal.colors.begin() +
+                                                      static_cast<std::ptrdiff_t>(t.pal_size));
+                    result.rendered = std::move(t.rendered);
+                    result.planes = std::move(t.planes);
                     result.palette = std::move(pal_keep);
-                    result.indices = std::move(sweep->indices);
-                    result.finalize_psnr(*image, sweep->total_error);
+                    result.indices = std::move(t.indices);
+                    result.finalize_psnr(*image, t.total_error);
                 }
                 result.mode = mode;
                 result.hires = compound_hires || mp_curr.is_hires;
@@ -4954,6 +5008,19 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             options.on_progress,
             /*jitter_amplitude=*/1.0f);
         if (winner) {
+            // The sweep trials skip pair fitting (too slow per trial).
+            // Pair-fit the winner's palette against the unjittered source
+            // with its own dither settings, and compare with plain.
+            float winner_s2 = score_rendered(winner->rendered);
+            for (auto& cand : {encode_plain_candidate(winner->dith, &*winner),
+                               encode_plain_candidate(base_dith, nullptr)}) {
+                if (!cand) continue;
+                float s2 = score_rendered(cand->rendered);
+                if (s2 > winner_s2) {
+                    winner_s2 = s2;
+                    winner = *cand;
+                }
+            }
             std::vector<Color3f> used_pal(winner->pal.colors.begin(),
                                           winner->pal.colors.begin() +
                                               static_cast<std::ptrdiff_t>(winner->pal_size));

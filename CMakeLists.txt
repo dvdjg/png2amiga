@@ -2939,6 +2939,20 @@ sys.exit(0 if ok else 1)")
     _add_score_test(stf-low       out.pi1 25.1 --mode stf-low)
     _add_score_test(ste-low       out.pi1 36.1 --mode ste-low)
     _add_score_test(dpf           out.iff 11.0 --mode lores --dpf)
+    _add_score_test(lores-aga-d8  out.png 81.2 --mode lores --depth 8 --chipset aga)
+    # --best must never score below the plain encode of the same mode.
+    foreach(_case IN ITEMS "lores-aga-d8|81.2|--mode;lores;--depth;8;--chipset;aga"
+                           "hires|34.4|--mode;hires;--depth;4")
+        string(REPLACE "|" ";" _parts "${_case}")
+        list(GET _parts 0 _name)
+        list(GET _parts 1 _min_s2)
+        list(SUBLIST _parts 2 -1 _mode_args)
+        add_test(NAME "output-score-${_name}-best-not-below-plain"
+            COMMAND ${_score_chk}
+                --in ${_pal_makena_in}
+                --out out.png --score-min ${_min_s2} --not-below-without best
+                -- ${_mode_args} --best)
+    endforeach()
 
     # DPF strips: dark shades expose candidate-key collisions; the ramp
     # requires future-color preloading and guard-aware planning/refinement.
