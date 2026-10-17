@@ -171,9 +171,11 @@ release — same features, somewhat slower. Building one on any platform:
 ./build/png2amiga --mode lores --depth 5 --sliced input.png output.iff
 ./build/png2amiga --mode ham6 --sliced input.png output.iff
 
-# Strip palette — mid-line swaps inside the active scanline. DPF or EHB only.
+# Strip palette — mid-line swaps inside the active scanline. OCS lores 1-4
+# planes, DPF, EHB or HAM6.
 # IFF has no chunk for mid-line MOVEs, so use .cpp (runnable AmigaOS viewer)
 # or .h (data-only) instead.
+./build/png2amiga --mode lores --depth 3 --sliced --strips input.png viewer.cpp
 ./build/png2amiga --mode lores --dpf --strips input.png viewer.cpp
 ./build/png2amiga --mode ehb --strips input.png data.h
 
@@ -529,7 +531,8 @@ strip palette. Cost is ~20–30× the single-pass time on most modes
 MOVEs at fixed **mid-line** copper slots — so a single scanline can
 display multiple palette banks across its width. Where the per-line
 sliced palette gives "this row's 64 colors", strips gives "this strip's
-64 colors", with strips on a 16-pixel grid. Strips ride on top of the
+64 colors", with strips on an 8-pixel grid in lores with 1-4 planes
+and a 16-pixel grid in the 6-plane modes. Strips ride on top of the
 sliced base (each line opens with the sliced palette reload in hblank,
 then mid-line swaps walk it through the visible region).
 
@@ -544,7 +547,19 @@ can get. png2amiga's contribution is wiring this style of per-strip
 palette change into a still-image converter on top of an OKLab
 error-diffused dither.
 
-Two strip modes:
+Strip modes:
+
+* **Lores + strips** (`--mode lores --depth 1-4 --strips`) — OCS lores
+  without DPF, 2-16 base colors. With 4 or fewer planes the copper gets
+  a MOVE every 8 pixels: 40 mid-line slots at x = 0, 8, ..., 312. The
+  hblank budget is 14 MOVEs with color 0 locked and 13 with color 0
+  unlocked. Depths 1-3 reset all registers in every hblank; depth 4
+  resets the 14 (or 13) registers with the largest error. Depth 1
+  always unlocks color 0. With color 0 unlocked, the viewer loads
+  `COLOR00` at x = 0 and restores it to black at x = 320, so the border
+  stays black on all sides. The viewer moves the bitplanes 5 pixels
+  left (`DDFSTRT $30`, `BPLCON1 $BB`) so that the slots land on exact
+  8-pixel boundaries.
 
 * **DPF + strips** (`--mode lores --dpf --strips`) — OCS dual-playfield,
   3-plane PF2 (8 base colors). The 8 PF2 registers are unconditionally
@@ -558,7 +573,7 @@ Two strip modes:
   per-line hblank tracking keeps each line inside the 13-MOVE EHB hblank
   budget. ~1100+ unique displayed colors per frame.
 
-Both modes are OCS-only, lores, no interlace. The DPF planner uses a
+All strip modes are OCS-only, lores, no interlace. The DPF planner uses a
 64-state beam with two-strip lookahead, allowing a color to be loaded
 before the pixels that need it. It then performs up to four palette
 refinement iterations: each initial or mid-line color is fitted to the
@@ -579,8 +594,8 @@ Both planners run once; repeating the old outer loop did not feed back
 new information.
 
 At each write boundary, a guard avoids selecting the register being
-changed (including its half-brite index in EHB). DPF guards one pixel
-on either side; EHB guards three, covering the earlier transitions seen
+changed (including its half-brite index in EHB). DPF and lores guard one
+pixel on either side (lores slot 0 at x = 0 has no guard); EHB guards three, covering the earlier transitions seen
 in the Amiberry timing probe. Previews and S2 scores include these
 constraints. The DPF and EHB planners also charge the nearest-color error
 caused by these guards on both sides of each proposed write, so they avoid
@@ -595,8 +610,10 @@ sliced and strip viewers wait until `$E1` before next-row palette
 writes, including across line 255; interlaced sliced viewers retain
 `$E3`.
 
-Slot positions were calibrated empirically on real OCS
-hardware via `--strips-probe` (see `src/strips.hpp`); the published
+Slot positions for the 6-plane modes were calibrated empirically on
+real OCS hardware via `--strips-probe` (see `src/strips.hpp`). The lores
+1-4 plane table was calibrated on the cycle-exact Copperline emulator
+with `--strips-debug`; the published
 hardware budget is ~14 hblank MOVEs + ~20 visible-area MOVEs per line in
 6-plane modes, and the calibrated slot tables sit comfortably within
 that.
@@ -922,7 +939,7 @@ Sliced palette (Amiga, per-line swaps; aka SHAM / DHIRES):
                                   0xFFDF line-255 wrap marker.
 
 Strip palette (mid-line swaps, OCS lores):
-  --strips                        Mid-line swaps; pair with --dpf or ehb
+  --strips                        Mid-line swaps (lores 1-4 planes, --dpf, ehb, ham6)
 
 Seamless tile:
   --tile                          Replicate input 3x3 before dither, export center
