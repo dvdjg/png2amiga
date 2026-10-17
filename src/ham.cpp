@@ -1012,6 +1012,64 @@ ScanlineResult encode_scanline_dp_per_strip_t(
     return {std::move(values), total_error};
 }
 
+// Forward-only form of encode_scanline_dp_per_strip_t: same expansion
+// order and pruning, so the error matches a whole-row run exactly.
+template<HamMetric M>
+float score_scanline_dp_per_strip_from_t(std::span<const Color3f> target_row,
+                                         const DpBeam& seed,
+                                         std::size_t x0,
+                                         std::span<const HamPrecomp> pres,
+                                         std::span<const std::span<const SRGBColor>> base_srgbs,
+                                         std::span<const std::uint16_t> strip_for_x,
+                                         std::size_t beam_width,
+                                         std::span<const std::size_t> capture_x,
+                                         std::vector<DpBeam>* captures) {
+    auto width = target_row.size();
+    if (captures) captures->assign(capture_x.size(), {});
+    if (seed.empty() || pres.empty() || base_srgbs.empty()) return 0.0f;
+    auto& sc = thread_scratch();
+    thread_local std::vector<BeamState> cur, nxt;
+    cur.clear();
+    for (const auto& e : seed)
+        cur.push_back({e.color, e.cumulative_error, 0, 0});
+    std::size_t ci = 0;
+    auto capture = [&](std::size_t x) {
+        while (captures && ci < capture_x.size() && capture_x[ci] == x) {
+            auto& out = (*captures)[ci++];
+            out.reserve(cur.size());
+            for (const auto& s : cur)
+                out.push_back({s.color, s.cumulative_error});
+        }
+    };
+    for (std::size_t x = x0; x < width; ++x) {
+        capture(x);
+        sc.candidates.clear();
+        auto si = static_cast<std::size_t>(strip_for_x[x]);
+        if (si >= pres.size()) si = pres.size() - 1;
+        const auto lab = color_space::linear_to_oklab(target_row[x]);
+        const auto srgb = linear_to_srgb8(target_row[x]);
+        for (std::size_t s = 0; s < cur.size(); ++s)
+            expand_ham_t<M>(cur[s].color,
+                            lab,
+                            srgb,
+                            cur[s].cumulative_error,
+                            static_cast<std::uint16_t>(s),
+                            pres[si],
+                            base_srgbs[si],
+                            sc.candidates);
+        if (pres[si].data_bits == 4)
+            prune_unique_ham6(sc, nxt, beam_width);
+        else
+            prune_beam(sc.candidates, nxt, beam_width, sc.err_idx);
+        cur.swap(nxt);
+    }
+    capture(width);
+    float best = std::numeric_limits<float>::max();
+    for (const auto& s : cur)
+        best = std::min(best, s.cumulative_error);
+    return best;
+}
+
 template<HamMetric M>
 ScanlineResult encode_scanline_dp_t(std::span<const Color3f> target_row,
                                     SRGBColor start_color,
@@ -2637,6 +2695,23 @@ ScanlineResult encode_scanline_dp_per_strip(std::span<const Color3f> target_row,
                                             HamMetric metric) {
     return encode_scanline_dp_per_strip_impl(
         target_row, start_color, pres, base_srgbs, strip_for_x, beam_width, metric);
+}
+
+float score_scanline_dp_per_strip_from(std::span<const Color3f> target_row,
+                                       const DpBeam& seed,
+                                       std::size_t x0,
+                                       std::span<const HamPrecomp> pres,
+                                       std::span<const std::span<const SRGBColor>> base_srgbs,
+                                       std::span<const std::uint16_t> strip_for_x,
+                                       std::size_t beam_width,
+                                       HamMetric metric,
+                                       std::span<const std::size_t> capture_x,
+                                       std::vector<DpBeam>* captures) {
+    if (metric == HamMetric::oklab2)
+        return score_scanline_dp_per_strip_from_t<HamMetric::oklab2>(
+            target_row, seed, x0, pres, base_srgbs, strip_for_x, beam_width, capture_x, captures);
+    return score_scanline_dp_per_strip_from_t<HamMetric::srgb_mse>(
+        target_row, seed, x0, pres, base_srgbs, strip_for_x, beam_width, capture_x, captures);
 }
 
 ScanlineResult encode_scanline_ham_pal_aware_per_strip(

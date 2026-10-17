@@ -3671,69 +3671,80 @@ Result<ScapResult> encode_strips_ham6_ocs(const Image& image,
         auto row_span = std::span<const Color3f>(row_pixels.data(), width);
         auto idx_span = std::span<const std::uint16_t>(strip_idx.data(), width);
 
-        // Build per-strip palette state by replaying the strips MOVEs
-        // currently in line_moves[y]. strip 0 starts from the line-
-        // entry palette (sliced_palettes[y]); each subsequent strip
-        // applies the MOVEs whose slot_index matches s-1.
-        auto build_strips = [&](std::vector<std::vector<Color3f>>& strip_pals,
-                                std::vector<std::vector<ham::SRGBColor>>& strip_srgbs,
-                                std::vector<ham::HamPrecomp>& strip_pres,
-                                std::vector<std::span<const ham::SRGBColor>>& strip_srgb_spans) {
-            strip_pals.assign(num_strips, {});
-            strip_srgbs.assign(num_strips, {});
-            strip_pres.clear();
-            strip_pres.reserve(num_strips);
-            strip_srgb_spans.clear();
-            strip_srgb_spans.reserve(num_strips);
+        // Per-strip palettes: the entry palette, then this row's mid-line
+        // MOVEs replayed in order (slot s-1 changes strip s onward).
+        // `extra` is a trial MOVE applied after the recorded ones.
+        struct StripPalettes {
+            std::vector<std::vector<Color3f>> pals;
+            std::vector<std::vector<ham::SRGBColor>> srgbs;
+            std::vector<ham::HamPrecomp> pres;
+            std::vector<std::span<const ham::SRGBColor>> spans;
+        };
+        auto build_strips = [&](StripPalettes& sp, const ScapMove* extra) {
+            sp.pals.assign(num_strips, {});
+            sp.srgbs.assign(num_strips, {});
+            sp.pres.clear();
+            sp.pres.reserve(num_strips);
+            sp.spans.clear();
+            sp.spans.reserve(num_strips);
             std::vector<Color3f> running_pal = entry_palette;
             if (running_pal.size() < kBaseColors) running_pal.resize(kBaseColors);
+            auto apply = [&](const ScapMove& m, std::size_t s) {
+                if (m.kind != ScapOpKind::kMove || m.slot_index != static_cast<int>(s - 1) ||
+                    m.reg >= kBaseColors)
+                    return;
+                auto rgb12 = m.rgb_ocs & 0xFFFu;
+                float r = static_cast<float>((rgb12 >> 8) & 0xF) / 15.0f;
+                float g = static_cast<float>((rgb12 >> 4) & 0xF) / 15.0f;
+                float bv = static_cast<float>(rgb12 & 0xF) / 15.0f;
+                running_pal[m.reg] = color_space::srgb_to_linear(Color3f{r, g, bv});
+            };
             for (std::size_t s = 0; s < num_strips; ++s) {
                 if (s > 0) {
-                    for (auto& m : line_moves[y]) {
-                        if (m.kind == ScapOpKind::kMove &&
-                            m.slot_index == static_cast<int>(s - 1) && m.reg < kBaseColors) {
-                            auto rgb12 = m.rgb_ocs & 0xFFFu;
-                            float r = static_cast<float>((rgb12 >> 8) & 0xF) / 15.0f;
-                            float g = static_cast<float>((rgb12 >> 4) & 0xF) / 15.0f;
-                            float bv = static_cast<float>(rgb12 & 0xF) / 15.0f;
-                            running_pal[m.reg] = color_space::srgb_to_linear(Color3f{r, g, bv});
-                        }
-                    }
+                    for (const auto& m : line_moves[y])
+                        apply(m, s);
+                    if (extra) apply(*extra, s);
                 }
-                strip_pals[s] = running_pal;
-                strip_srgbs[s].resize(kBaseColors);
+                sp.pals[s] = running_pal;
+                sp.srgbs[s].resize(kBaseColors);
                 for (std::size_t k = 0; k < kBaseColors; ++k)
-                    strip_srgbs[s][k] = ham::linear_to_srgb8(running_pal[k]);
-                strip_pres.emplace_back(std::span<const Color3f>(strip_pals[s].data(), kBaseColors),
-                                        /*data_bits=*/4);
-                strip_srgb_spans.emplace_back(strip_srgbs[s].data(), kBaseColors);
+                    sp.srgbs[s][k] = ham::linear_to_srgb8(running_pal[k]);
+                sp.pres.emplace_back(std::span<const Color3f>(sp.pals[s].data(), kBaseColors),
+                                     /*data_bits=*/4);
+                sp.spans.emplace_back(sp.srgbs[s].data(), kBaseColors);
             }
         };
 
-        // DP encode without triple refinement — used for candidate
-        // scoring (refine adds ~50% cost without changing relative
-        // ordering of nearby candidates much).
-        auto encode_dp_only = [&](const std::vector<std::vector<ham::SRGBColor>>& strip_srgbs,
-                                  std::span<const ham::HamPrecomp> pres_span,
-                                  std::span<const std::span<const ham::SRGBColor>> srgbs_span)
-            -> ham::ScanlineResult {
-            ham::SRGBColor start = strip_srgbs[0].empty() ? ham::SRGBColor{0, 0, 0}
-                                                          : strip_srgbs[0][0];
-            return ham::encode_scanline_dp_per_strip(
-                row_span, start, pres_span, srgbs_span, idx_span, kBeamWidth, ham_metric);
+        // DP beam checkpoints before each strip's first pixel. A swap at
+        // slot s-1 changes only strip s onward, so its DP resumes from
+        // ckpt[s] instead of re-encoding the unchanged row prefix.
+        StripPalettes cur;
+        build_strips(cur, nullptr);
+        std::vector<std::size_t> strip_x0(num_strips);
+        for (std::size_t s = 0; s < num_strips; ++s)
+            strip_x0[s] = strip_x_range(s).first;
+        std::vector<ham::DpBeam> ckpt(num_strips);
+        ckpt[0] = {{cur.srgbs[0][0], 0.0f}};
+        auto store_ckpts = [&](std::size_t s, std::vector<ham::DpBeam>& caps) {
+            for (std::size_t i = 0; i < caps.size(); ++i)
+                ckpt[s + 1 + i] = std::move(caps[i]);
         };
-
-        // Baseline: encode the row with no strips swaps yet (sliced only).
-        std::vector<std::vector<Color3f>> cur_pals;
-        std::vector<std::vector<ham::SRGBColor>> cur_srgbs;
-        std::vector<ham::HamPrecomp> cur_pres;
-        std::vector<std::span<const ham::SRGBColor>> cur_srgb_spans;
-        build_strips(cur_pals, cur_srgbs, cur_pres, cur_srgb_spans);
-        double cur_err = static_cast<double>(
-            encode_dp_only(cur_srgbs,
-                           std::span<const ham::HamPrecomp>(cur_pres),
-                           std::span<const std::span<const ham::SRGBColor>>(cur_srgb_spans))
-                .error);
+        double cur_err = 0.0;
+        {
+            std::vector<ham::DpBeam> caps;
+            cur_err = static_cast<double>(ham::score_scanline_dp_per_strip_from(
+                row_span,
+                ckpt[0],
+                0,
+                cur.pres,
+                cur.spans,
+                idx_span,
+                kBeamWidth,
+                ham_metric,
+                std::span<const std::size_t>(strip_x0).subspan(1),
+                &caps));
+            store_ckpts(0, caps);
+        }
 
         std::size_t strips_budget = strips_share;
         std::size_t strips_used = 0;
@@ -3858,44 +3869,55 @@ Result<ScapResult> encode_strips_ham6_ocs(const Image& image,
                 });
             }
 
-            // DP-evaluate each survivor: tentatively push the swap as a
-            // ScapMove, rebuild strip palettes (which propagates the
-            // swap forward into all later strips), encode, score by
-            // sl.error, restore. Pick the best swap iff it strictly
-            // beats cur_err.
-            std::size_t best_slot = 0;
-            std::size_t best_cand = 0;
+            // DP-score each survivor from this strip's checkpoint, in
+            // parallel. Take the first strict improvement in rank order,
+            // so the choice does not depend on the thread count.
+            struct Trial {
+                double err = 0.0;
+                std::vector<ham::DpBeam> caps;
+            };
+            std::vector<Trial> trials(ranked.size());
+            const auto later_x = std::span<const std::size_t>(strip_x0).subspan(s + 1);
+            pipeline::parallel_for(ranked.size(), [&](std::size_t i) {
+                const auto& cs = ranked[i];
+                const auto move = make_move(static_cast<std::uint8_t>(cs.slot),
+                                            palette::linear_to_ocs(cands[cs.cand_idx]),
+                                            static_cast<int>(s - 1));
+                StripPalettes sp;
+                build_strips(sp, &move);
+                trials[i].err = static_cast<double>(
+                    ham::score_scanline_dp_per_strip_from(row_span,
+                                                          ckpt[s],
+                                                          strip_x0[s],
+                                                          sp.pres,
+                                                          sp.spans,
+                                                          idx_span,
+                                                          kBeamWidth,
+                                                          ham_metric,
+                                                          later_x,
+                                                          &trials[i].caps));
+            });
+            std::size_t best_i = ranked.size();
             double best_err = cur_err;
-            bool found = false;
-            for (auto& cs : ranked) {
-                auto rgb_ocs = palette::linear_to_ocs(cands[cs.cand_idx]);
-                line_moves[y].push_back(make_move(
-                    static_cast<std::uint8_t>(cs.slot), rgb_ocs, static_cast<int>(s - 1)));
-                build_strips(cur_pals, cur_srgbs, cur_pres, cur_srgb_spans);
-                auto trial = encode_dp_only(
-                    cur_srgbs,
-                    std::span<const ham::HamPrecomp>(cur_pres),
-                    std::span<const std::span<const ham::SRGBColor>>(cur_srgb_spans));
-                line_moves[y].pop_back();
-                double e = static_cast<double>(trial.error);
-                if (e < best_err) {
-                    best_err = e;
-                    best_slot = cs.slot;
-                    best_cand = cs.cand_idx;
-                    found = true;
+            for (std::size_t i = 0; i < ranked.size(); ++i) {
+                if (trials[i].err < best_err) {
+                    best_err = trials[i].err;
+                    best_i = i;
                 }
             }
-            if (!found) continue;
+            if (best_i == ranked.size()) continue;
 
             // Apply best swap for real.
+            const auto best_slot = ranked[best_i].slot;
+            const auto best_cand = ranked[best_i].cand_idx;
             strip_pal[best_slot] = cands[best_cand];
             strip_pal_lab[best_slot] = cands_lab[best_cand];
             auto rgb_ocs = palette::linear_to_ocs(cands[best_cand]);
             line_moves[y].push_back(
                 make_move(static_cast<std::uint8_t>(best_slot), rgb_ocs, static_cast<int>(s - 1)));
+            store_ckpts(s, trials[best_i].caps);
             cur_err = best_err;
             ++strips_used;
-            (void)kHblankCeiling;
         }
         // DEBUG: pad strips slots — every slot 0..num_slots-1 must have a
         // MOVE (filler if no swap was chosen) so per-line copper budget
@@ -3932,7 +3954,7 @@ Result<ScapResult> encode_strips_ham6_ocs(const Image& image,
                 make_wait(static_cast<std::uint8_t>(table.end_of_line_hpos), vp, -1));
         }
         // Rebuild final strip state for the post-loop encode_with.
-        build_strips(cur_pals, cur_srgbs, cur_pres, cur_srgb_spans);
+        build_strips(cur, nullptr);
 
         // ---- 4. Final encode with triple refinement -------------------
         // The HAM-DP-aware planner above only accepted swaps that
@@ -3949,10 +3971,9 @@ Result<ScapResult> encode_strips_ham6_ocs(const Image& image,
         // for the visual benefit of the dither pattern, so we let the
         // planner optimize for "best HAM encoding given these palettes"
         // and then the final encode applies the dither.
-        auto pres_span = std::span<const ham::HamPrecomp>(cur_pres.data(), cur_pres.size());
-        auto srgbs_span = std::span<const std::span<const ham::SRGBColor>>(cur_srgb_spans.data(),
-                                                                           cur_srgb_spans.size());
-        ham::SRGBColor start = cur_srgbs[0].empty() ? ham::SRGBColor{0, 0, 0} : cur_srgbs[0][0];
+        auto pres_span = std::span<const ham::HamPrecomp>(cur.pres);
+        auto srgbs_span = std::span<const std::span<const ham::SRGBColor>>(cur.spans);
+        ham::SRGBColor start = cur.srgbs[0][0];
         ham::ScanlineResult sl;
         if (dither::is_yliluoma(dither_settings.method)) {
             sl = ham::encode_scanline_ham_pal_aware_per_strip(
@@ -3964,7 +3985,7 @@ Result<ScapResult> encode_strips_ham6_ocs(const Image& image,
             ham::refine_scanline_triple_per_strip(
                 sl.values, row_span, start, pres_span, srgbs_span, idx_span, kTripleBeam, ham_metric);
         }
-        auto& strip_srgbs = cur_srgbs;
+        auto& strip_srgbs = cur.srgbs;
         // Render the per-pixel preview by replaying the encoded values
         // through the strip's palette + HAM rolling state.
         ham::SRGBColor prev = start;
