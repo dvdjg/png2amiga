@@ -890,12 +890,13 @@ const dpfAvailable = computed(() => {
 //   * lores (depth 1-4, no DPF): 2-16 base colors, 8-px slot grid.
 //   * DPF + lores (depth=3): 3-plane PF2, 8 base colors.
 //   * EHB (mode=ehb): 32 base + 32 hardware-derived half-brites.
+//   * HAM6 (mode=ham6, lores, no interlace): 16 base colours.
 // strips is an extension to sliced (per-line palette evolution); enabling
 // strips turns sliced on too, and turning sliced off cascades strips off.
 const scapAvailable = computed(() => {
   if (effectiveChipset(options.mode, options.chipset) !== 'ocs') return false
-  // EHB (depth is fixed at 6 for EHB; mode string identifies it)
-  if (options.mode === 'ehb') return true
+  // EHB and HAM6 have fixed depth; the mode string identifies them.
+  if (options.mode === 'ehb' || options.mode === 'ham6') return true
   if (options.mode !== 'lores') return false
   // DPF lores at depth=3, plain lores at depth 1-4
   return options.dualPlayfield ? options.depth === 3 : options.depth <= 4
@@ -2785,9 +2786,9 @@ async function loadExample(example: typeof EXAMPLES[number]) {
                 </div>
               </div>
 
-              <!-- strips — mid-line palette swaps (OCS lores only, DPF or EHB) -->
+              <!-- strips — mid-line palette swaps (OCS lores 1-4 planes, DPF, EHB or HAM6) -->
               <div v-if="scapAvailable" class="grid align-items-center">
-                <label class="col-4 text-xs text-color-secondary font-semibold" title="Strip palette: mid-line palette swaps inside the displayed area, on top of the sliced palette's per-line evolution. Lores 1-4 planes: 39 MOVEs per scanline at 8-px stride. DPF (3-plane PF2, 8 base colors) and EHB (32 base + 32 half-brites): 19 MOVEs at 16-px stride.">Strips</label>
+                <label class="col-4 text-xs text-color-secondary font-semibold" title="Strip palette: mid-line palette swaps inside the displayed area, on top of the sliced palette's per-line evolution. Lores 1-4 planes: 39 MOVEs per scanline at 8-px stride. DPF (3-plane PF2, 8 base colors), EHB (32 base + 32 half-brites) and HAM6 (16 base colors): 19 MOVEs at 16-px stride.">Strips</label>
                 <div class="col-8 flex align-items-center gap-2">
                   <ToggleSwitch v-model="options.scap" />
                   <span style="color: #888; font-size: 0.625rem;">mid-line swaps</span>
