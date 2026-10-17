@@ -490,7 +490,10 @@ Result<ScapResult> encode_strips_ehb_ocs(
 // Output: 6-plane bitplane data, 16-entry base palette, per-line strips
 // MOVE tables, and a rendered preview Image.
 //
-// v0: single greedy pass, no joint refinement, no best wiring.
+// Rows are planned in order (13-write hblank restore). Each slot takes the
+// swap with the lowest row HAM-DP error from a HAM-aware candidate
+// pre-screen; written colours are then refit over their register
+// lifetimes. --best sweeps jitter seeds, dither strengths and diversities.
 // ---------------------------------------------------------------------------
 Result<ScapResult> encode_strips_ham6_ocs(
     const Image& image,

@@ -167,6 +167,11 @@ ScanlineResult encode_scanline_dp_per_strip(std::span<const Color3f> target_row,
                                             std::size_t beam_width,
                                             HamMetric metric);
 
+// Ordered-dither target for the HAM encoders: the method's threshold at
+// (x, y) biases the pixel in OKLab before op selection.
+Color3f ordered_dither_target(
+    Color3f c, dither::Method method, std::size_t x, std::size_t y, float strength);
+
 // One DP beam entry: held output colour and cumulative error. A beam
 // captured after pixel x-1 resumes the DP at pixel x exactly, because
 // pixels before x do not depend on the palettes of later strips.

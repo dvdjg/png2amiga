@@ -36,6 +36,21 @@ Color3f srgb8_to_linear(SRGBColor c) {
 }
 
 // HamPrecomp definition (declared in ham.hpp).
+Color3f ordered_dither_target(
+    Color3f c, dither::Method method, std::size_t x, std::size_t y, float strength) {
+    auto lab = color_space::linear_to_oklab(c);
+    float threshold = dither::ordered_threshold(method, x, y);
+    lab.L += threshold * strength * 0.15f;
+    lab.a += threshold * strength * 0.03f;
+    lab.b += threshold * strength * 0.03f;
+    auto linear = color_space::oklab_to_linear(lab);
+    return {
+        std::clamp(linear.r, 0.0f, 1.0f),
+        std::clamp(linear.g, 0.0f, 1.0f),
+        std::clamp(linear.b, 0.0f, 1.0f),
+    };
+}
+
 HamPrecomp::HamPrecomp(std::span<const Color3f> palette, std::size_t db)
     : data_bits(db), num_data_values(std::size_t{1} << db) {
     palette_lab.resize(palette.size());
@@ -1814,19 +1829,8 @@ Result<HamResult> encode_ham_generic(const Image& image,
                 SRGBColor start = base_srgb[0];
                 auto row = image.row(y);
 
-                for (std::size_t x = 0; x < w; ++x) {
-                    auto lab = color_space::linear_to_oklab(row[x]);
-                    float threshold = dither::ordered_threshold(opts.dither_method, x, y);
-                    lab.L += threshold * strength * 0.15f;
-                    lab.a += threshold * strength * 0.03f;
-                    lab.b += threshold * strength * 0.03f;
-                    auto linear = color_space::oklab_to_linear(lab);
-                    dithered_row[x] = {
-                        std::clamp(linear.r, 0.0f, 1.0f),
-                        std::clamp(linear.g, 0.0f, 1.0f),
-                        std::clamp(linear.b, 0.0f, 1.0f),
-                    };
-                }
+                for (std::size_t x = 0; x < w; ++x)
+                    dithered_row[x] = ordered_dither_target(row[x], opts.dither_method, x, y, strength);
 
                 std::span<const Color3f> dithered_span{dithered_row};
                 auto scanline = encode_scanline_dp(
@@ -2496,19 +2500,8 @@ Result<HamResult> encode_ham_copper_generic(const Image& image,
                     err = sl.error;
                 } else if (use_ordered) {
                     std::vector<Color3f> dithered_row(w);
-                    for (std::size_t x = 0; x < w; ++x) {
-                        auto lab = color_space::linear_to_oklab(row[x]);
-                        float threshold = dither::ordered_threshold(opts.dither_method, x, y);
-                        lab.L += threshold * opts.dither_strength * 0.15f;
-                        lab.a += threshold * opts.dither_strength * 0.03f;
-                        lab.b += threshold * opts.dither_strength * 0.03f;
-                        auto linear = color_space::oklab_to_linear(lab);
-                        dithered_row[x] = {
-                            std::clamp(linear.r, 0.0f, 1.0f),
-                            std::clamp(linear.g, 0.0f, 1.0f),
-                            std::clamp(linear.b, 0.0f, 1.0f),
-                        };
-                    }
+                    for (std::size_t x = 0; x < w; ++x)
+                        dithered_row[x] = ordered_dither_target(row[x], opts.dither_method, x, y, opts.dither_strength);
                     std::span<const Color3f> dr{dithered_row};
                     auto scanline = encode_scanline_dp(
                         dr, start, line_pre, srgb_span, beam_width, opts.metric);
