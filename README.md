@@ -594,8 +594,8 @@ Both planners run once; repeating the old outer loop did not feed back
 new information.
 
 At each write boundary, a guard avoids selecting the register being
-changed (including its half-brite index in EHB). DPF and lores guard one
-pixel on either side (lores slot 0 at x = 0 has no guard); EHB guards three. Previews and S2 scores include these
+changed (including its half-brite index in EHB). DPF, lores and EHB guard one
+pixel on either side (lores slot 0 at x = 0 has no guard). Previews and S2 scores include these
 constraints. The DPF and EHB planners also charge the nearest-color error
 caused by these guards on both sides of each proposed write, so they avoid
 swaps whose apparent benefit disappears at the boundary. DPF lifetime
