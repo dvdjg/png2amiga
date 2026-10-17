@@ -68,6 +68,8 @@ Algorithm resolve_algorithm(amiga::Mode mode,
 // image:     input image (linear RGB)
 // max_colors: maximum number of colors in the palette (2-256)
 // algo:      quantization algorithm
+// pnn_bins:  PNN histogram bins per OKLab axis (0 = kPnnBins); other
+//            algorithms ignore it
 //
 // Returns a Palette with at most max_colors entries.
 // ---------------------------------------------------------------------------
@@ -75,7 +77,8 @@ Algorithm resolve_algorithm(amiga::Mode mode,
 Result<Palette> quantize(const Image& image,
                          std::size_t max_colors,
                          Algorithm algo = Algorithm::median_cut,
-                         int palette_diversity = 0);
+                         int palette_diversity = 0,
+                         int pnn_bins = 0);
 
 // ---------------------------------------------------------------------------
 // Median-cut quantization (direct interface)
@@ -101,10 +104,14 @@ Palette median_cut(std::span<const Color3f> colors,
 // median-cut but comparable to ocs_bruteforce.
 // ---------------------------------------------------------------------------
 
+// `bins`: continuous-space histogram bins per OKLab axis (snap_to_ocs
+// starts from the 4096 OCS colours instead).
+inline constexpr int kPnnBins = 24;
 Palette pnn_quantize(std::span<const Color3f> colors,
                      std::size_t max_colors,
                      int palette_diversity = 0,
-                     bool snap_to_ocs = false);
+                     bool snap_to_ocs = false,
+                     int bins = kPnnBins);
 
 // ---------------------------------------------------------------------------
 // Palette diversity pass (ham_convert-inspired).

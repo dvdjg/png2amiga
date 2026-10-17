@@ -862,7 +862,8 @@ Palette median_cut(std::span<const Color3f> colors, std::size_t max_colors, int 
 Palette pnn_quantize(std::span<const Color3f> colors,
                      std::size_t max_colors,
                      int palette_diversity,
-                     bool snap_to_ocs) {
+                     bool snap_to_ocs,
+                     int bins) {
 
     if (max_colors == 0) max_colors = 1;
     if (colors.empty()) {
@@ -929,14 +930,15 @@ Palette pnn_quantize(std::span<const Color3f> colors,
             clusters.push_back(c);
         }
     } else {
-        // Continuous-space histogram: 24³ = 13824 bins in OKLab.
-        constexpr std::size_t BINS = 24;
+        // Continuous-space histogram: bins³ cells in OKLab (24³ = 13824
+        // by default).
+        const auto BINS = static_cast<std::size_t>(std::max(bins, 1));
         constexpr float L_min = 0.0f, L_max = 1.0f;
         constexpr float a_min = -0.5f, a_max = 0.5f;
         constexpr float b_min = -0.5f, b_max = 0.5f;
-        constexpr float L_scale = static_cast<float>(BINS) / (L_max - L_min);
-        constexpr float a_scale = static_cast<float>(BINS) / (a_max - a_min);
-        constexpr float b_scale = static_cast<float>(BINS) / (b_max - b_min);
+        const float L_scale = static_cast<float>(BINS) / (L_max - L_min);
+        const float a_scale = static_cast<float>(BINS) / (a_max - a_min);
+        const float b_scale = static_cast<float>(BINS) / (b_max - b_min);
 
         struct Bin {
             double L{}, a{}, b{};
@@ -1481,7 +1483,8 @@ void apply_palette_diversity(Palette& palette,
 Result<Palette> quantize(const Image& image,
                          std::size_t max_colors,
                          Algorithm algo,
-                         int palette_diversity) {
+                         int palette_diversity,
+                         int pnn_bins) {
     if (max_colors == 0 || max_colors > 256) {
         return std::unexpected{Error{
             ErrorCode::invalid_depth,
@@ -1508,7 +1511,8 @@ Result<Palette> quantize(const Image& image,
         return pnn_quantize(image.pixels(),
                             max_colors,
                             palette_diversity,
-                            /*snap_to_ocs=*/false);
+                            /*snap_to_ocs=*/false,
+                            pnn_bins > 0 ? pnn_bins : kPnnBins);
     case Algorithm::gpu_restart:
         // Lloyd k-means in OKLab + parallel restarts on Apple GPU.
         // Falls through to median_cut at runtime when Metal is

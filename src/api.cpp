@@ -47,6 +47,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <format>
@@ -862,7 +863,8 @@ Result<PlainAutoTrial> encode_plain_auto(const Image& img,
                                          const std::vector<PinSpec>& pins,
                                          const std::vector<bool>& tmask,
                                          bool fit_pairs = false,
-                                         const PlainAutoTrial* start = nullptr) {
+                                         const PlainAutoTrial* start = nullptr,
+                                         int pnn_bins = 0) {
     // Atari uses the full palette (no border slot tied to index 0).
     bool is_atari_local = amiga::is_atari(mode);
     bool lock_zero = lock_color0 && (has_transparency || !is_atari_local);
@@ -942,7 +944,8 @@ Result<PlainAutoTrial> encode_plain_auto(const Image& img,
         }
         auto qfn = [&](std::size_t k) -> Result<Palette> {
             if (is_ega_mode) return quantize::ega_histogram(ega_snapped, k);
-            return quantize::quantize(img, k, quantize_algo(chipset, mode), palette_diversity);
+            return quantize::quantize(
+                img, k, quantize_algo(chipset, mode), palette_diversity, pnn_bins);
         };
         auto quantized = palette_locks::two_pass_quantize(qfn, qc.qcount, qc.kfallback, lock_zero);
         if (!quantized) return std::unexpected{quantized.error()};
@@ -4729,26 +4732,28 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
 
         // Plain's own encode (with pair fitting): a candidate in both
         // pickers below, so --best never scores below the non-best output.
-        auto encode_plain_candidate = [&](const dither::Settings& d, const PlainAutoTrial* start) {
-            return encode_plain_auto(*image,
-                                     depth,
-                                     max_colors,
-                                     mode,
-                                     chipset,
-                                     d,
-                                     options.palette_diversity,
-                                     options.refine_iterations,
-                                     options.lock_color0,
-                                     has_transparency,
-                                     /*use_dpf=*/false,
-                                     /*match_range=*/options.match_range,
-                                     options.locks,
-                                     options.reserves,
-                                     options.pins,
-                                     tmask,
-                                     /*fit_pairs=*/true,
-                                     start);
-        };
+        auto encode_plain_candidate =
+            [&](const dither::Settings& d, const PlainAutoTrial* start, int pnn_bins = 0) {
+                return encode_plain_auto(*image,
+                                         depth,
+                                         max_colors,
+                                         mode,
+                                         chipset,
+                                         d,
+                                         options.palette_diversity,
+                                         options.refine_iterations,
+                                         options.lock_color0,
+                                         has_transparency,
+                                         /*use_dpf=*/false,
+                                         /*match_range=*/options.match_range,
+                                         options.locks,
+                                         options.reserves,
+                                         options.pins,
+                                         tmask,
+                                         /*fit_pairs=*/true,
+                                         start,
+                                         pnn_bins);
+            };
 
         const auto& mp_curr = amiga::get_mode_params(mode);
         bool pop_only = chipset == amiga::Chipset::ocs && !mp_curr.is_hires && depth >= 1 &&
@@ -4976,6 +4981,59 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 return result;
             }
             // All three failed — fall through to single-pass.
+        }
+
+        // From 64 colours up the PNN histogram resolution moves S2 by
+        // about +-1 per image, more than the jitter/diversity sweep finds
+        // (at 128+ colours apply_palette_diversity is a no-op, so that
+        // sweep ran every trial twice). Sweep the bin count instead, every
+        // trial pair-fitted; plain is trial 0 so ties keep it. Measured on
+        // examples/*.jpg at 320 wide: below 64 colours the jitter sweep
+        // scores as well or better; other dither strengths add <0.05 S2
+        // for twice the trials; 32-40 bins never change the pick.
+        if (max_colors >= 64 && quantize_algo(chipset, mode) == quantize::Algorithm::pnn) {
+            std::vector<int> bins{0};  // 0 = plain's own resolution
+            for (int b : {48, 64, 80, 96})
+                bins.push_back(b);
+            std::vector<std::optional<PlainAutoTrial>> trials(bins.size());
+            std::vector<float> scores(bins.size(), -std::numeric_limits<float>::infinity());
+            std::atomic<std::size_t> done{0};
+            pipeline::parallel_for(bins.size(), [&](std::size_t i) {
+                auto t = encode_plain_candidate(base_dith, nullptr, bins[i]);
+                if (t) {
+                    scores[i] = score_rendered(t->rendered);
+                    trials[i] = std::move(*t);
+                }
+                if (options.on_progress) {
+                    options.on_progress(static_cast<float>(done.fetch_add(1) + 1) /
+                                            static_cast<float>(bins.size()),
+                                        "best");
+                }
+            });
+            std::size_t win = 0;
+            for (std::size_t i = 1; i < bins.size(); ++i)
+                if (scores[i] > scores[win]) win = i;
+            if (trials[win]) {
+                if (options.on_progress) options.on_progress(1.0f, "done");
+                auto& t = *trials[win];
+                PipelineResult result;
+                result.rendered = std::move(t.rendered);
+                result.planes = std::move(t.planes);
+                result.palette = std::vector<Color3f>(t.pal.colors.begin(),
+                                                      t.pal.colors.begin() +
+                                                          static_cast<std::ptrdiff_t>(t.pal_size));
+                result.indices = std::move(t.indices);
+                result.mode = mode;
+                result.hires = compound_hires || mp_curr.is_hires;
+                result.interlace = options.interlace;
+                result.dpf = false;
+                result.aga = is_aga;
+                result.has_transparency = has_transparency;
+                result.transparency_mask = tmask;
+                result.finalize_psnr(*image, t.total_error);
+                return result;
+            }
+            // Every trial failed — fall through to the jitter sweep.
         }
 
         auto encode_once = [&](const Image& img,
