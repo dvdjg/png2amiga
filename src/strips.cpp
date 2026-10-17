@@ -518,14 +518,21 @@ float lab_error(const color_space::OKLab& a, const color_space::OKLab& b) {
 // chain late and the late chain end cascades into the next line. The
 // right-border COLOR00 restore (unlocked colour 0) ends the chain one MOVE
 // later and costs one hblank MOVE: 13.
+// guard_slot0: apply the +/-1 px landing guard to slot 0 too. Lores slot 0
+// lands exactly at x=0 on Copperline, so it is unguarded there (as is the
+// x=320 restore); a guard there bans its register from columns 0-1.
 struct IndexedLayout {
     const ScapSlotTable* table;
     bool dpf;
     std::size_t max_hblank_moves;
+    bool guard_slot0;
 };
 constexpr IndexedLayout kDpfLayout{
-    &kStrips6bplOcs, true, copper::max_changes_per_line(3, false, false, amiga::Chipset::ocs)};
-constexpr IndexedLayout kLoresLayout{&kStrips4bplLores, false, 14};
+    &kStrips6bplOcs,
+    true,
+    copper::max_changes_per_line(3, false, false, amiga::Chipset::ocs),
+    /*guard_slot0=*/true};
+constexpr IndexedLayout kLoresLayout{&kStrips4bplLores, false, 14, /*guard_slot0=*/false};
 
 // Registers to write for palette index k (-1 = unused entry).
 constexpr std::array<int, 2> layout_regs(const IndexedLayout& layout, std::size_t k) {
@@ -836,6 +843,10 @@ static Result<ScapResult> encode_strips_indexed(
     // may target it unless --lock-color0 pins it.
     const std::size_t k_plan = (layout.dpf || lock_color0) ? 1u : 0u;
     const std::size_t k_pick = layout.dpf ? 1u : 0u;
+    // Slots whose MOVE gets the +/-1 px landing guard.
+    auto guarded = [&](std::size_t slot) {
+        return slot != 0 || layout.guard_slot0;
+    };
 
     // Stage-2 error diffusion setup. Honors the user's --dither choice
     // by pulling the diffusion kernel from dither.hpp. The buffer is
@@ -1304,7 +1315,7 @@ static Result<ScapResult> encode_strips_indexed(
                         }
                         std::array<GuardProbe, 2 * kDpfGuardRadius + 1> guard{};
                         std::size_t guard_count = 0;
-                        {
+                        if (guarded(s)) {
                             const int landing = table.slots[s].pixel_x;
                             for (int gx = std::max(0, landing - kDpfGuardRadius);
                                  gx <= landing + kDpfGuardRadius &&
@@ -1424,7 +1435,7 @@ static Result<ScapResult> encode_strips_indexed(
                 std::vector<std::uint32_t> fit_mask(width, 0);
                 for (std::size_t slot = 0; slot < table.slots.size(); ++slot) {
                     int reg = best.dec_reg[slot];
-                    if (reg < 0) continue;
+                    if (reg < 0 || !guarded(slot)) continue;
                     const int landing = table.slots[slot].pixel_x;
                     for (int gx = std::max(0, landing - kDpfGuardRadius);
                          gx <= landing + kDpfGuardRadius &&
@@ -1549,6 +1560,7 @@ static Result<ScapResult> encode_strips_indexed(
         for (std::size_t y = 0; y < height; ++y) {
             for (const auto& op : line_moves[y]) {
                 if (op.kind != ScapOpKind::kMove || op.slot_index < 0) continue;
+                if (!guarded(static_cast<std::size_t>(op.slot_index))) continue;
                 const int k = layout_index(layout, op.reg, kBaseColors);
                 if (k < 0) continue;
                 const int landing = table.slots[static_cast<std::size_t>(op.slot_index)].pixel_x;

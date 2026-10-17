@@ -113,8 +113,11 @@ def main():
                 assert registers[0] == 0, 'COLOR00 not black in the left border'
             slot = 0
             held = registers[0]
+            # --slot-shift models a +/-1 px landing error on guarded slots.
+            # Lores slot 0 is unguarded: it lands exactly at x=0.
+            shifts = [0 if is_lores and s == 0 else args.slot_shift for s in range(len(slots))]
             for x in range(320):
-                while slot < len(slots) and x >= max(0, slots[slot] + args.slot_shift):
+                while slot < len(slots) and x >= max(0, slots[slot] + shifts[slot]):
                     move(visible[slot])
                     slot += 1
                 word = y * 20 + x // 16
