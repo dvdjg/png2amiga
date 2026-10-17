@@ -501,8 +501,8 @@ struct GuardProbe {
     float old_error;
     bool left;
 };
-constexpr int kDpfGuardRadius = 1;
-constexpr int kEhbGuardRadius = 3;
+// Pixels guarded on either side of a MOVE landing (DPF, lores, EHB).
+constexpr int kGuardRadius = 1;
 
 float lab_error(const color_space::OKLab& a, const color_space::OKLab& b) {
     return color_space::fma_dist_sq(a.L - b.L, a.a - b.a, a.b - b.b);
@@ -1313,12 +1313,12 @@ static Result<ScapResult> encode_strips_indexed(
                                                 future_min[h - 1].data());
                             }
                         }
-                        std::array<GuardProbe, 2 * kDpfGuardRadius + 1> guard{};
+                        std::array<GuardProbe, 2 * kGuardRadius + 1> guard{};
                         std::size_t guard_count = 0;
                         if (guarded(s)) {
                             const int landing = table.slots[s].pixel_x;
-                            for (int gx = std::max(0, landing - kDpfGuardRadius);
-                                 gx <= landing + kDpfGuardRadius &&
+                            for (int gx = std::max(0, landing - kGuardRadius);
+                                 gx <= landing + kGuardRadius &&
                                  static_cast<std::size_t>(gx) < width;
                                  ++gx) {
                                 const auto& guard_target =
@@ -1437,8 +1437,8 @@ static Result<ScapResult> encode_strips_indexed(
                     int reg = best.dec_reg[slot];
                     if (reg < 0 || !guarded(slot)) continue;
                     const int landing = table.slots[slot].pixel_x;
-                    for (int gx = std::max(0, landing - kDpfGuardRadius);
-                         gx <= landing + kDpfGuardRadius &&
+                    for (int gx = std::max(0, landing - kGuardRadius);
+                         gx <= landing + kGuardRadius &&
                          static_cast<std::size_t>(gx) < width;
                          ++gx)
                         fit_mask[static_cast<std::size_t>(gx)] |= std::uint32_t{1} << reg;
@@ -1564,8 +1564,8 @@ static Result<ScapResult> encode_strips_indexed(
                 const int k = layout_index(layout, op.reg, kBaseColors);
                 if (k < 0) continue;
                 const int landing = table.slots[static_cast<std::size_t>(op.slot_index)].pixel_x;
-                for (int x = std::max(0, landing - kDpfGuardRadius);
-                     x <= landing + kDpfGuardRadius && static_cast<std::size_t>(x) < width;
+                for (int x = std::max(0, landing - kGuardRadius);
+                     x <= landing + kGuardRadius && static_cast<std::size_t>(x) < width;
                      ++x)
                     boundary_mask[y * width + static_cast<std::size_t>(x)] |=
                         static_cast<std::uint16_t>(1u << k);
@@ -2785,12 +2785,12 @@ Result<ScapResult> encode_strips_ehb_ocs(
                                 min_dist_update(fs, lh.L, lh.a, lh.b, future_min[h - 1].data());
                             }
                         }
-                        std::array<GuardProbe, 2 * kEhbGuardRadius + 1> guard{};
+                        std::array<GuardProbe, 2 * kGuardRadius + 1> guard{};
                         std::size_t guard_count = 0;
                         {
                             const int landing = table.slots[s].pixel_x;
-                            for (int gx = std::max(0, landing - kEhbGuardRadius);
-                                 gx <= landing + kEhbGuardRadius &&
+                            for (int gx = std::max(0, landing - kGuardRadius);
+                                 gx <= landing + kGuardRadius &&
                                  static_cast<std::size_t>(gx) < width;
                                  ++gx) {
                                 const auto& guard_target =
@@ -3107,9 +3107,9 @@ Result<ScapResult> encode_strips_ehb_ocs(
         }
 
         // The base and half-brite index both change when a register is
-        // written; guard kEhbGuardRadius pixels on either side of it. On
+        // written; guard kGuardRadius pixels on either side of it. On
         // Copperline every MOVE lands exactly at its table position, so
-        // the guard is not needed for timing.
+        // the guard affects quality only.
         std::vector<std::uint32_t> boundary_mask(width * height, 0);
         for (std::size_t y = 0; y < height; ++y) {
             for (const auto& op : line_moves[y]) {
@@ -3119,8 +3119,8 @@ Result<ScapResult> encode_strips_ehb_ocs(
                 if (palette::linear_to_ocs(strip_eff_per_row[y][slot][op.reg]) == op.rgb_ocs)
                     continue;
                 const int landing = table.slots[slot].pixel_x;
-                for (int x = std::max(0, landing - kEhbGuardRadius);
-                     x <= landing + kEhbGuardRadius && static_cast<std::size_t>(x) < width;
+                for (int x = std::max(0, landing - kGuardRadius);
+                     x <= landing + kGuardRadius && static_cast<std::size_t>(x) < width;
                      ++x)
                     boundary_mask[y * width + static_cast<std::size_t>(x)] |= std::uint32_t{1}
                                                                               << op.reg;

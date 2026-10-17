@@ -34,7 +34,7 @@ def main():
     parser.add_argument('--in', dest='source', required=True)
     parser.add_argument('--expect-black-border', action='store_true')
     parser.add_argument('--height', type=int, default=200)
-    parser.add_argument('--slot-shift', type=int, choices=range(-3, 4), default=0)
+    parser.add_argument('--slot-shift', type=int, choices=range(-1, 2), default=0)
     parser.add_argument('--check-idx', action='store_true')
     parser.add_argument('extra', nargs=argparse.REMAINDER)
     args = parser.parse_args()

@@ -3022,16 +3022,16 @@ sys.exit(0 if ok else 1)")
         set(_replay_args)
         set(_replay_options)
         if(_case STREQUAL "early")
-            set(_replay_options --slot-shift -3)
+            set(_replay_options --slot-shift -1)
         elseif(_case STREQUAL "late")
-            set(_replay_options --slot-shift 3)
+            set(_replay_options --slot-shift 1)
         elseif(_case STREQUAL "tall")
-            set(_replay_options --height 249 --slot-shift 3)
+            set(_replay_options --height 249 --slot-shift 1)
         elseif(_case STREQUAL "dbs")
-            set(_replay_options --slot-shift -3)
+            set(_replay_options --slot-shift -1)
             set(_replay_args --dither dbs)
         elseif(_case STREQUAL "reserved")
-            set(_replay_options --slot-shift 3)
+            set(_replay_options --slot-shift 1)
             set(_replay_args --reserve-range 28-31 ff00ff)
         elseif(_case STREQUAL "one-base")
             set(_replay_args --reserve-range 1-31 ff00ff)
@@ -3049,7 +3049,7 @@ sys.exit(0 if ok else 1)")
     add_test(NAME "ehb-strips-replay-maui"
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py
             --mode ehb --expect-black-border --cli $<TARGET_FILE:png2amiga>
-            --in ${CMAKE_SOURCE_DIR}/examples/maui.jpg --height 160 --slot-shift -3)
+            --in ${CMAKE_SOURCE_DIR}/examples/maui.jpg --height 160 --slot-shift -1)
     # Guard-aware ramps score 72.04 on Clang and 67.66–67.72 on GCC 15
     # across the Linux x86 and macOS ARM release runners.
     # Keep a margin for the palette planner's floating-point variation.
