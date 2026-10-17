@@ -2125,7 +2125,7 @@ Result<ScapResult> encode_strips_ehb_ocs(
     if (table.slots.empty()) {
         return std::unexpected{Error{
             ErrorCode::unsupported_mode,
-            "Strips EHB planner: kStrips6bplOcs slot table is empty",
+            "Strips EHB planner: kStrips6bplEhb slot table is empty",
         }};
     }
 
@@ -3107,8 +3107,9 @@ Result<ScapResult> encode_strips_ehb_ocs(
         }
 
         // The base and half-brite index both change when a register is
-        // written. The EHB probe lands up to two pixels earlier than the
-        // nominal table in Amiberry; allow three pixels on either side.
+        // written; guard kEhbGuardRadius pixels on either side of it. On
+        // Copperline every MOVE lands exactly at its table position, so
+        // the guard is not needed for timing.
         std::vector<std::uint32_t> boundary_mask(width * height, 0);
         for (std::size_t y = 0; y < height; ++y) {
             for (const auto& op : line_moves[y]) {

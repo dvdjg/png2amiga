@@ -150,11 +150,11 @@ inline const ScapSlotTable kStrips6bplOcs{
 //
 // Same DMA shape as 6-plane DPF (6 plane fetches per 16 lores px) but
 // EHB has no PF2OF / DBLPF combiner machinery, so the actual MOVE
-// landing positions on the bus differ from DPF in subtle ways. This
-// table starts at the clean naive 16-px grid (8, 24, 40, ..., 296) —
-// no per-slot offset corrections yet. Calibrate empirically with
-// --strips-debug + the stripe tuner: each visible black/white transition
-// position is the actual MOVE landing for that slot. Adjust below.
+// landing positions on the bus differ from DPF in subtle ways.
+//
+// Calibrated on Copperline (A500 OCS, 68000) with --strips-debug, where
+// each stripe edge is one MOVE landing: MOVE k lands at x = 16k + 7,
+// one pixel before the naive 16k + 8 grid. Same landings as HAM6.
 constexpr int kEHB = -1;
 inline const ScapSlotTable kStrips6bplEhb{
     /*total_planes=*/6,
@@ -162,10 +162,10 @@ inline const ScapSlotTable kStrips6bplEhb{
     /*end_of_line_hpos=*/0xE1,  // Keep next-row resets past the visible right edge.
     /*slots=*/
     {
-        {8 - kEHB},   {24 - kEHB},  {40 - kEHB},  {56 - kEHB},  {72 - kEHB},
-        {88 - kEHB},  {104 - kEHB}, {120 - kEHB}, {136 - kEHB}, {152 - kEHB},
-        {168 - kEHB}, {184 - kEHB}, {200 - kEHB}, {216 - kEHB}, {232 - kEHB},
-        {248 - kEHB}, {264 - kEHB}, {280 - kEHB}, {296 - kEHB},
+        {8 + kEHB},   {24 + kEHB},  {40 + kEHB},  {56 + kEHB},  {72 + kEHB},
+        {88 + kEHB},  {104 + kEHB}, {120 + kEHB}, {136 + kEHB}, {152 + kEHB},
+        {168 + kEHB}, {184 + kEHB}, {200 + kEHB}, {216 + kEHB}, {232 + kEHB},
+        {248 + kEHB}, {264 + kEHB}, {280 + kEHB}, {296 + kEHB},
     }};
 
 // kStrips6bplHam6 — OCS HAM6, 6 bitplanes, lores 320 px display.
