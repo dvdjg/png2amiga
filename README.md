@@ -691,8 +691,8 @@ columns can be compared apples-to-apples:
 
 |     | Encoder     | Mode                              | PSNR (dB) | SSIMULACRA2 | Time (s) |
 |:---:|-------------|-----------------------------------|----------:|------------:|---------:|
-| 🟦 | **png2amiga** | **lores d=8 AGA**                 | 31.43     | **82.05**   |     0.46 |
-| 🟦 | png2amiga   | lores d=8 AGA + best              | 32.11     | 80.72       |     2.85 |
+| 🟦 | **png2amiga** | **lores d=8 AGA + best**          | 31.50     | **84.39**   |     1.68 |
+| 🟦 | png2amiga   | lores d=8 AGA                     | 31.82     | 83.99       |     0.96 |
 | 🟦 | pngquant    | libimagequant 256 (`--speed 1`)   | 33.61     | 80.13       |     0.06 |
 | 🟦 | ffmpeg      | 256 (`palettegen`+FS)†            | 31.18     | 78.61       |     0.06 |
 | 🟪 | png2amiga   | HAM6 + sliced + strips            | 31.78     | 76.57       |    49.34 |
@@ -733,12 +733,12 @@ quantize the rest" flag — `-remap` / `-mapfile` / their equivalents
 accept either no constraints or a fully-fixed palette. Their palette
 is unconstrained on these runs, which is a small advantage on
 photographic input that doesn't move the rankings. At 256 colors
-libimagequant has the highest PSNR (33.61 dB) but lands ~2
+libimagequant has the highest PSNR (33.61 dB) but lands ~4
 SSIMULACRA2 below png2amiga — typical MSE-vs-perceptual split when
 the quantizer runs in linear/sRGB rather than a perceptually uniform
 space. Notable per-tool observations: **gifsicle** at 256 has very
 high PSNR (32.94 dB, beating most of the Amiga-mode encoders) but
-sits 13 SSIMULACRA2 below png2amiga; **pngnq** (NeuQuant) lands well
+sits 15 SSIMULACRA2 below png2amiga; **pngnq** (NeuQuant) lands well
 below its perceptual-aware competitors despite the slowest-quality
 setting; **didder**'s `mmcq:N` median-cut pairs a clean dither
 implementation with an unsophisticated quantizer.
