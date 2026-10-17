@@ -1131,8 +1131,12 @@ Result<CopperResult> encode_copper(const Image& image,
         auto algo = quantizer_override.has_value()
                         ? *quantizer_override
                         : quantize::resolve_algorithm(amiga::Mode::lores, chipset, "");
+        // AGA 16+ colours: 48 PNN bins, as plain lores/hires. Mean S2 on
+        // examples/*.jpg at 320 wide, 24 -> 48 bins: sliced d5 67.87 ->
+        // 68.32, d8 83.62 -> 84.85.
+        const int pnn_bins = quantize::plain_pnn_bins(amiga::Mode::lores, chipset, num_colors);
         auto qfn = [&](std::size_t k) -> Result<Palette> {
-            auto r = quantize::quantize(image, k, algo);
+            auto r = quantize::quantize(image, k, algo, 0, pnn_bins);
             if (!r) return std::unexpected{r.error()};
             Palette p = std::move(*r);
             if (chipset != amiga::Chipset::aga) {

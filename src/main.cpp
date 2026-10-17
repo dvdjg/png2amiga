@@ -3106,7 +3106,8 @@ Result<Palette> auto_quantize(const Image& image,
                               amiga::Chipset chipset,
                               int palette_diversity = 0,
                               std::string_view quantizer = {},
-                              amiga::Mode mode = amiga::Mode::lores) {
+                              amiga::Mode mode = amiga::Mode::lores,
+                              int pnn_bins = quantize::kPnnBins) {
     // EGA palette selection:
     //
     //   Mode 10h (ega-hi, 640×350 @ 21.85 kHz): the IBM EGA card enables
@@ -3141,11 +3142,12 @@ Result<Palette> auto_quantize(const Image& image,
         auto pal = quantize::pnn_quantize(image.pixels(),
                                           max_colors,
                                           palette_diversity,
-                                          /*snap_to_ocs=*/chipset != amiga::Chipset::aga);
+                                          /*snap_to_ocs=*/chipset != amiga::Chipset::aga,
+                                          pnn_bins);
         return pal;
     }
     auto algo = quantize::resolve_algorithm(mode, chipset, quantizer);
-    return quantize::quantize(image, max_colors, algo, palette_diversity);
+    return quantize::quantize(image, max_colors, algo, palette_diversity, pnn_bins);
 }
 
 // Map the CLI --quantizer string to an explicit Algorithm. Returns
@@ -10317,6 +10319,10 @@ int run_main(int argc, char* argv[]) {
             // no longer needs to force median-cut for byte-stability.
             // resolve_algorithm picks gpu-restart on Apple Metal,
             // median-cut otherwise.
+            const int plain_bins = config->copper || config->scap
+                                       ? quantize::kPnnBins
+                                       : quantize::plain_pnn_bins(
+                                             config->mode, chipset, max_colors);
             auto quantized = palette_locks::two_pass_quantize(
                 [&](std::size_t k) -> Result<Palette> {
                     return auto_quantize(*quant_src,
@@ -10324,7 +10330,8 @@ int run_main(int argc, char* argv[]) {
                                          chipset,
                                          config->palette_diversity,
                                          config->quantizer,
-                                         config->mode);
+                                         config->mode,
+                                         plain_bins);
                 },
                 qc.qcount,
                 qc.kfallback,

@@ -3097,8 +3097,12 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 // EHB-aware best palette we can build offline.
                 Palette seed_pal;
                 {
+                    // AGA: 48 PNN bins (mean S2 72.96 -> 74.12 on
+                    // examples/*.jpg at 320 wide).
+                    const int seed_bins = chipset == amiga::Chipset::aga ? 48 : quantize::kPnnBins;
                     auto qfn = [&](std::size_t k) -> Result<Palette> {
-                        auto q = quantize::quantize(img, k, quantize::Algorithm::pnn, diversity);
+                        auto q = quantize::quantize(
+                            img, k, quantize::Algorithm::pnn, diversity, seed_bins);
                         if (!q) return std::unexpected{q.error()};
                         Palette p = std::move(*q);
                         snap_to_chipset(p, chipset, mode);
@@ -3749,10 +3753,13 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             std::size_t reserves_ehb = *reserves_in_pal_ehb;
             auto qc = palette_locks::quant_counts_for_assemble(
                 32, options.locks, reserves_ehb, lock_zero_ehb);
+            // AGA: 64 PNN bins (mean S2 54.72 -> 55.99 on examples/*.jpg
+            // at 320 wide; 32 and 48 bins swing per image by up to -7).
+            const int ehb_bins = chipset == amiga::Chipset::aga ? 64 : quantize::kPnnBins;
             auto quantized = palette_locks::two_pass_quantize(
                 [&](std::size_t k) -> Result<Palette> {
                     return quantize::quantize(
-                        *image, k, quantize::Algorithm::pnn, options.palette_diversity);
+                        *image, k, quantize::Algorithm::pnn, options.palette_diversity, ehb_bins);
                 },
                 qc.qcount,
                 qc.kfallback,
@@ -4732,8 +4739,9 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
 
         // Plain's own encode (with pair fitting): a candidate in both
         // pickers below, so --best never scores below the non-best output.
+        const int plain_bins = quantize::plain_pnn_bins(mode, chipset, max_colors);
         auto encode_plain_candidate =
-            [&](const dither::Settings& d, const PlainAutoTrial* start, int pnn_bins = 0) {
+            [&](const dither::Settings& d, const PlainAutoTrial* start, int pnn_bins) {
                 return encode_plain_auto(*image,
                                          depth,
                                          max_colors,
@@ -4923,7 +4931,7 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             // are in play (otherwise pop_search's internal k-means seeding
             // suffices). Pick the highest-scoring candidate; ties keep
             // the earlier one.
-            auto plain = encode_plain_candidate(base_dith, nullptr);
+            auto plain = encode_plain_candidate(base_dith, nullptr, plain_bins);
             enum Kind { K_POP, K_SEED, K_SWEEP, K_PLAIN };
             struct Cand {
                 float s2;
@@ -4992,9 +5000,9 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         // scores as well or better; other dither strengths add <0.05 S2
         // for twice the trials; 32-40 bins never change the pick.
         if (max_colors >= 64 && quantize_algo(chipset, mode) == quantize::Algorithm::pnn) {
-            std::vector<int> bins{0};  // 0 = plain's own resolution
-            for (int b : {48, 64, 80, 96})
-                bins.push_back(b);
+            std::vector<int> bins{plain_bins};
+            for (int b : {quantize::kPnnBins, 48, 64, 80, 96})
+                if (b != plain_bins) bins.push_back(b);
             std::vector<std::optional<PlainAutoTrial>> trials(bins.size());
             std::vector<float> scores(bins.size(), -std::numeric_limits<float>::infinity());
             std::atomic<std::size_t> done{0};
@@ -5070,8 +5078,8 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             // Pair-fit the winner's palette against the unjittered source
             // with its own dither settings, and compare with plain.
             float winner_s2 = score_rendered(winner->rendered);
-            for (auto& cand : {encode_plain_candidate(winner->dith, &*winner),
-                               encode_plain_candidate(base_dith, nullptr)}) {
+            for (auto& cand : {encode_plain_candidate(winner->dith, &*winner, plain_bins),
+                               encode_plain_candidate(base_dith, nullptr, plain_bins)}) {
                 if (!cand) continue;
                 float s2 = score_rendered(cand->rendered);
                 if (s2 > winner_s2) {
@@ -5322,7 +5330,9 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                                        effective_reserves,
                                        effective_pins,
                                        tmask,
-                                       /*fit_pairs=*/true);
+                                       /*fit_pairs=*/true,
+                                       /*start=*/nullptr,
+                                       quantize::plain_pnn_bins(mode, chipset, max_colors));
         if (!trial) return std::unexpected{trial.error()};
         std::vector<Color3f> used_palette(trial->pal.colors.begin(),
                                           trial->pal.colors.begin() +

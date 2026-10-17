@@ -113,6 +113,19 @@ Palette pnn_quantize(std::span<const Color3f> colors,
                      bool snap_to_ocs = false,
                      int bins = kPnnBins);
 
+// PNN bins for a plain single-palette encode. AGA lores/hires with 16+
+// colours use 48: mean S2 on examples/*.jpg at 320 wide, 24 -> 48 bins,
+// d4 41.18 -> 42.08, d5 60.65 -> 61.34, d6 71.91 -> 72.86,
+// d7 79.77 -> 80.18, d8 84.16 -> 85.10 (at most +0.1 s); d2-d3 gain
+// nothing. DPF (16-colour PF2) gains as d4. Every other caller keeps
+// kPnnBins.
+inline int plain_pnn_bins(amiga::Mode mode, amiga::Chipset chipset, std::size_t max_colors) {
+    using M = amiga::Mode;
+    const bool plain = mode == M::lores || mode == M::lores_interlace || mode == M::hires ||
+                       mode == M::hires_interlace;
+    return plain && chipset == amiga::Chipset::aga && max_colors >= 16 ? 48 : kPnnBins;
+}
+
 // ---------------------------------------------------------------------------
 // Palette diversity pass (ham_convert-inspired).
 //
