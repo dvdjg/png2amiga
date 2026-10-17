@@ -465,17 +465,17 @@ export const ALPHA_DITHER_METHODS: NamedItem[] = [
 ]
 
 export const SLIDERS: Slider[] = [
-  { key: 'gamma',          label: 'Gamma',       min: 0.1, max: 5, step: 0.05, default: 1,
+  { key: 'gamma',          label: 'Gamma',       min: 0.1, max: 5, step: 0.01, default: 1,
     tip: 'Power curve applied before color matching. >1 darkens midtones, <1 brightens them.' },
-  { key: 'brightness',     label: 'Brightness',  min: -1,  max: 1, step: 0.05, default: 0,
+  { key: 'brightness',     label: 'Brightness',  min: -1,  max: 1, step: 0.01, default: 0,
     tip: 'Additive lightness shift in perceptual OKLab space.' },
-  { key: 'contrast',       label: 'Contrast',    min: 0,   max: 3, step: 0.05, default: 1,
+  { key: 'contrast',       label: 'Contrast',    min: 0,   max: 3, step: 0.01, default: 1,
     tip: 'Scale around perceptual mid-gray. 1.0 = no change, >1 increases contrast.' },
-  { key: 'saturation',     label: 'Saturation',  min: 0,   max: 3, step: 0.05, default: 1,
+  { key: 'saturation',     label: 'Saturation',  min: 0,   max: 3, step: 0.01, default: 1,
     tip: 'Chroma scaling in OKLab space. 0 = grayscale, 1 = original, >1 = boosted color.' },
   { key: 'hueShift',       label: 'Hue',         min: -180, max: 180, step: 1,  default: 0,
     tip: 'Rotate all colors in OKLab. Shifts hues to better match the Amiga palette.' },
-  { key: 'sharpen',        label: 'Sharpen',     min: -1,  max: 2, step: 0.05, default: 0,
+  { key: 'sharpen',        label: 'Sharpen',     min: -1,  max: 2, step: 0.01, default: 0,
     tip: 'Negative = blur (reduces noise), positive = sharpen (enhances edges).' },
   { key: 'blackPoint',     label: 'Black Pt',    min: 0,   max: 0.5, step: 0.01, default: 0,
     tip: 'Clip the darkest fraction of the image. Deepens blacks.' },

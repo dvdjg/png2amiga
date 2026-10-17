@@ -2881,11 +2881,11 @@ async function loadExample(example: typeof EXAMPLES[number]) {
               <div class="grid align-items-center">
                 <label class="col-4 text-xs text-color-secondary font-semibold" title="Shift the alpha cutoff. 0 = standard 50% threshold. Negative = more opaque pixels pass, positive = fewer.">Threshold</label>
                 <div class="col-5">
-                  <Slider v-model="options.alphaThreshold" :min="-0.5" :max="0.5" :step="0.05" class="w-full" />
+                  <Slider v-model="options.alphaThreshold" :min="-0.5" :max="0.5" :step="0.01" class="w-full" />
                 </div>
                 <div class="col-3">
-                  <InputNumber v-model="options.alphaThreshold" :min="-0.5" :max="0.5" :step="0.05"
-                    :minFractionDigits="2" :maxFractionDigits="2" class="w-full input-sm" />
+                  <InputNumber v-model="options.alphaThreshold" :min="-0.5" :max="0.5" :step="0.01"
+                    :minFractionDigits="2" :maxFractionDigits="6" class="w-full input-sm" />
                 </div>
               </div>
 
@@ -2899,11 +2899,11 @@ async function loadExample(example: typeof EXAMPLES[number]) {
               <div v-if="options.alphaDither !== 'none'" class="grid align-items-center">
                 <label class="col-4 text-xs text-color-secondary font-semibold" title="Alpha dither strength. Controls how aggressively alpha is dithered.">Strength</label>
                 <div class="col-5">
-                  <Slider v-model="options.alphaDitherStrength" :min="0" :max="3.0" :step="0.05" class="w-full" />
+                  <Slider v-model="options.alphaDitherStrength" :min="0" :max="3.0" :step="0.01" class="w-full" />
                 </div>
                 <div class="col-3">
-                  <InputNumber v-model="options.alphaDitherStrength" :min="0" :max="3.0" :step="0.05"
-                    :minFractionDigits="2" :maxFractionDigits="2" class="w-full input-sm" />
+                  <InputNumber v-model="options.alphaDitherStrength" :min="0" :max="3.0" :step="0.01"
+                    :minFractionDigits="2" :maxFractionDigits="6" class="w-full input-sm" />
                 </div>
               </div>
             </div>
@@ -2919,7 +2919,7 @@ async function loadExample(example: typeof EXAMPLES[number]) {
                 </div>
                 <div class="col-3">
                   <InputNumber v-model="options[s.key]" :min="s.min" :max="s.max" :step="s.step"
-                    :minFractionDigits="2" :maxFractionDigits="2" class="w-full input-sm" />
+                    :minFractionDigits="2" :maxFractionDigits="6" class="w-full input-sm" />
                 </div>
               </div>
 
