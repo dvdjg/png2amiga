@@ -4179,7 +4179,21 @@ int write_amiga_output(AmigaOutputBundle& out) {
         return 0;
     }
 
-    // Default: PNG preview. When indices + global palette are
+    // Anything else is not an Amiga output format. Amiga executables come
+    // from building the .cpp viewer (build-amiga.sh), not from the CLI.
+    if (!ends_with(path, ".png")) {
+        if (!out.disallow_message.empty()) {
+            std::println(stderr, "{}", out.disallow_message);
+        } else {
+            std::println(stderr,
+                         "Output: unsupported extension for '{}' (use .png, .iff/.ilbm, .h, "
+                         ".cpp/.c, .raw/.bin/.bpl or .pal)",
+                         path);
+        }
+        return exit_code::usage;
+    }
+
+    // PNG preview. When indices + global palette are
     // available (lores/hires/EHB plain, no DPF, no per-line palette),
     // emit a paletted PNG-8 so downstream tooling that needs the
     // palette can read it directly from the PNG instead of a sidecar

@@ -1128,6 +1128,15 @@ sys.exit(0 if got==expect else (print(f'expected {expect}, got {got}') or 1))"
                 ${CMAKE_BINARY_DIR}/strips-reject-d5.png
     )
     set_tests_properties("strips-rejects-lores-depth5" PROPERTIES WILL_FAIL TRUE)
+    # Amiga outputs only write known formats; anything else (e.g. .exe,
+    # which comes from building the .cpp viewer) is an error, not a PNG.
+    add_test(
+        NAME "amiga-output-rejects-exe"
+        COMMAND png2amiga --mode lores --depth 3
+                ${PNG2AMIGA_TEST_INPUT}
+                ${CMAKE_BINARY_DIR}/amiga-output.exe
+    )
+    set_tests_properties("amiga-output-rejects-exe" PROPERTIES WILL_FAIL TRUE)
 
     # --tile: pre-replicate input 3x3, run pipeline, crop centre. Verify
     # that the encoded .h has the requested centre dimensions (W x H,
