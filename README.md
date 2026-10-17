@@ -668,7 +668,7 @@ PSNR — they can land on the optimum-MSE centroid; the Amiga-mode
 encoders have to snap to the nearest 4-bit-per-channel grid point.
 
 That's why some 32-color rows below show png2amiga's PSNR _behind_
-pngquant's by ~1 dB while still leading perceptually (51.55 vs
+pngquant's by ~1 dB while still leading perceptually (52.02 vs
 51.14 SSIMULACRA2 — the 12-bit handicap costs PSNR but the 
 OKLab + ocs-bruteforce quantizer still wins the eyeball test). And it's
 why the 256-color tier is closer on PSNR: there both encoders
@@ -691,17 +691,19 @@ columns can be compared apples-to-apples:
 
 |     | Encoder     | Mode                              | PSNR (dB) | SSIMULACRA2 | Time (s) |
 |:---:|-------------|-----------------------------------|----------:|------------:|---------:|
-| 🟦 | **png2amiga** | **lores d=8 AGA + best**       | 32.35     | **83.02**   |    15.04 |
-| 🟦 | png2amiga   | lores d=8 AGA                     | 32.37     | 82.87       |     0.76 |
+| 🟦 | **png2amiga** | **lores d=8 AGA**                 | 31.43     | **82.05**   |     0.46 |
+| 🟦 | png2amiga   | lores d=8 AGA + best              | 32.11     | 80.72       |     2.85 |
 | 🟦 | pngquant    | libimagequant 256 (`--speed 1`)   | 33.61     | 80.13       |     0.06 |
 | 🟦 | ffmpeg      | 256 (`palettegen`+FS)†            | 31.18     | 78.61       |     0.06 |
-| 🟪 | png2amiga   | HAM6 + sliced + best              | 30.99     | 76.15       |    21.72 |
-| 🟪 | png2amiga   | HAM6 + sliced                     | 30.50     | 75.60       |     0.25 |
+| 🟪 | png2amiga   | HAM6 + sliced + strips            | 31.78     | 76.57       |    49.34 |
+| 🟪 | png2amiga   | HAM6 + sliced + best              | 30.99     | 76.13       |    17.64 |
+| 🟪 | png2amiga   | HAM6 + sliced                     | 30.53     | 75.59       |     0.24 |
 | 🟪 | ham_convert | SHAM6 (`ham6_sliced`, `dither_fs`)| 31.81     | 74.82       |    20.18 |
-| 🟪 | png2amiga   | HAM6 (no copper)                  | 30.22     | 72.94       |     0.19 |
-| 🟪 | png2amiga   | HAM6 + best (no copper)           | 30.22     | 72.94       |     9.40 |
+| 🟩 | png2amiga   | EHB + strips + best               | 30.25     | 73.85       |    21.59 |
+| 🟩 | png2amiga   | EHB + strips                      | 29.81     | 73.60       |     1.01 |
+| 🟪 | png2amiga   | HAM6 + best (no copper)           | 30.18     | 72.94       |    10.98 |
+| 🟪 | png2amiga   | HAM6 (no copper)                  | 30.23     | 72.77       |     0.18 |
 | 🟦 | Netpbm      | pnmquant 256 (`-floyd`)†          | 31.59     | 72.20       |     0.11 |
-| 🟩 | png2amiga   | EHB + strips + best               | 29.39     | 71.60       |    18.55 |
 | 🟪 | ham_convert | HAM6 q1 (fastest, `dither_fs`)    | 29.45     | 70.41       |     4.08 |
 | 🟪 | ham_convert | HAM6 q7 (max quality, `dither_fs`)| 30.04     | 70.05       |    38.30 |
 | 🟦 | gifsicle    | 256 (`--dither floyd-steinberg`)† | 32.94     | 69.47       |     0.02 |
@@ -709,11 +711,11 @@ columns can be compared apples-to-apples:
 | 🟦 | ImageMagick | 256 (`-dither FS`)†               | 30.69     | 66.85       |     0.05 |
 | 🟦 | pngnq       | 256 (NeuQuant + FS, `-s 1`)†      | 31.61     | 65.73       |     0.07 |
 | 🟪 | abc         | HAM6 (`-floyd`)                   | 28.31     | 63.24       |     1.96 |
-| 🟩 | png2amiga   | EHB + best (no copper)            | 23.75     | 62.54       |    13.81 |
+| 🟩 | png2amiga   | EHB + best (no copper)            | 23.81     | 62.70       |     9.23 |
 | 🟪 | abc         | SHAM6 (`-floyd`)                  | 26.66     | 60.59       |     1.22 |
-| 🟧 | png2amiga   | lores d=5 + best                  | 23.42     | 57.83       |    16.19 |
-| 🟩 | png2amiga   | EHB (no copper)                   | 25.03     | 52.38       |     0.09 |
-| 🟧 | png2amiga   | lores d=5                         | 24.96     | 51.57       |     0.10 |
+| 🟧 | png2amiga   | lores d=5 + best                  | 22.61     | 60.08       |    11.67 |
+| 🟩 | png2amiga   | EHB (no copper)                   | 24.69     | 54.67       |     0.22 |
+| 🟧 | png2amiga   | lores d=5                         | 24.89     | 52.02       |     0.17 |
 | 🟧 | pngquant    | libimagequant 32 (`--speed 1`)    | 26.08     | 51.14       |     0.48 |
 | 🟩 | ham_convert | EHB (`dither_fs`)                 | 25.82     | 49.68       |     6.06 |
 | 🟧 | ham_convert | ocs32 (`dither_fs`)               | 24.42     | 37.70       |     6.08 |
@@ -731,7 +733,7 @@ quantize the rest" flag — `-remap` / `-mapfile` / their equivalents
 accept either no constraints or a fully-fixed palette. Their palette
 is unconstrained on these runs, which is a small advantage on
 photographic input that doesn't move the rankings. At 256 colors
-libimagequant has the highest PSNR (33.61 dB) but lands ~3
+libimagequant has the highest PSNR (33.61 dB) but lands ~2
 SSIMULACRA2 below png2amiga — typical MSE-vs-perceptual split when
 the quantizer runs in linear/sRGB rather than a perceptually uniform
 space. Notable per-tool observations: **gifsicle** at 256 has very
