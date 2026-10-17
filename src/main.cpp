@@ -3984,6 +3984,7 @@ struct AmigaOutputBundle {
     std::string strips_label;
     int strips_anchor_hpos = 0;
     int strips_total_planes = 0;
+    int strips_display_shift = 0;
 
     // Fade-to (CLI cross-fade): pre-computed per-frame palette MOVEs
     // for the .cpp/.c viewer to animate at runtime.
@@ -4057,6 +4058,7 @@ int write_amiga_output(AmigaOutputBundle& out) {
             ch.strips_label = out.strips_label;
             ch.strips_anchor_hpos = out.strips_anchor_hpos;
             ch.strips_total_planes = out.strips_total_planes;
+            ch.strips_display_shift = out.strips_display_shift;
             ch.fade_in = false;  // strips owns the per-line stream itself
         }
         if (!out.fade_per_frame_values.empty()) {
@@ -8697,6 +8699,7 @@ int run_main(int argc, char* argv[]) {
                     out.strips_label = std::string(variant->label);
                     out.strips_anchor_hpos = variant->table->line_gate_hpos;
                     out.strips_total_planes = variant->table->total_planes;
+                    out.strips_display_shift = variant->table->display_shift_px;
                 }
             }
             int rc = write_amiga_output(out);
@@ -9731,6 +9734,7 @@ int run_main(int argc, char* argv[]) {
             out.strips_label = std::string(variant->label);
             out.strips_anchor_hpos = variant->table->line_gate_hpos;
             out.strips_total_planes = variant->table->total_planes;
+            out.strips_display_shift = variant->table->display_shift_px;
             out.allow_iff = false;
             out.allow_raw = false;
             out.allow_pal = false;

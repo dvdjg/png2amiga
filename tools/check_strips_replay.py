@@ -3,6 +3,8 @@
 
 Uses the established 320px OCS slot calibration, not a cycle-level emulator.
 Checks export/preview agreement and the fixed copper instruction budget.
+Lores additionally checks the black frame: COLOR00 is black at frame start,
+in hblank and after x=319 on every line.
 """
 import argparse
 from pathlib import Path
@@ -15,7 +17,7 @@ from PIL import Image
 
 SLOTS = (0, 8, 23, 40, 55, 71, 88, 104, 120, 135,
          152, 168, 184, 200, 215, 232, 247, 263, 280, 295)
-LORES_SLOTS = (0,) + tuple(range(7, 304, 8))
+LORES_SLOTS = tuple(range(0, 320, 8))
 
 
 def words(text):
@@ -41,7 +43,11 @@ def main():
     is_lores = args.mode == 'lores'
     slots = {'ham6': tuple(range(7, 296, 16)), 'ehb': tuple(range(9, 282, 16)),
              'dpf': SLOTS, 'lores': LORES_SLOTS}[args.mode]
-    gate_hpos, hblank_budget = {'dpf': (0x38, 14), 'lores': (0x3E, 13)}.get(args.mode, (0x3C, 13))
+    # Lores colour 0 is unlocked with --no-lock-color0.
+    frame_color0 = is_lores and '--no-lock-color0' in extra
+    gate_hpos, hblank_budget = {'dpf': (0x38, 14),
+                                'lores': (0x3C, 13 if frame_color0 else 14)}.get(args.mode,
+                                                                                 (0x3C, 13))
     plane_count = args.depth if is_lores else 6
     with tempfile.TemporaryDirectory() as directory:
         header = Path(directory) / 'image.h'
@@ -64,6 +70,8 @@ def main():
         if is_dpf:
             assert not any(planes[0] + planes[2] + planes[4]), 'PF1 must remain empty'
         registers = (array('replay_palette') + [0] * 32)[:32]  # COLOR00..31
+        if is_lores:
+            assert registers[0] == 0, 'Frame must start with COLOR00 black'
         copper = re.search(r'replay_strips_copper_list\[.*?\]\s*=\s*\{(.*?)\};',
                            text, re.S).group(1)
         rows = [words(line) for line in copper.splitlines() if '/* y=' in line]
@@ -72,14 +80,23 @@ def main():
         for y, row in enumerate(rows):
             ops = list(zip(row[::2], row[1::2]))
             waits = [i for i, (address, _) in enumerate(ops) if address & 1]
-            assert len(waits) == 2 and waits[-1] == len(ops) - 1
             assert waits[0] <= hblank_budget, 'Hblank budget exceeded'
             assert ops[waits[0]] == ((((44 + y) & 255) << 8) | gate_hpos | 1, 0xFFFE)
-            expected_end = (((44 + y) & 255) << 8) | 0xE1
-            if 44 + y == 255 and 44 + args.height > 256:
-                expected_end = max(expected_end, 0xFFDF)
-            assert ops[-1] == (expected_end, 0xFFFE)
-            visible = ops[waits[0] + 1:waits[1]]
+            if is_lores:
+                # No end-of-line WAIT; unlocked colour 0 ends with the restore.
+                assert len(waits) == 1
+                visible = ops[waits[0] + 1:]
+                if frame_color0:
+                    assert visible[-1] == (0x180, 0), 'Missing COLOR00 restore at x=320'
+                    assert visible[0][0] == 0x180, 'Slot 0 must load COLOR00'
+                    visible = visible[:-1]
+            else:
+                assert len(waits) == 2 and waits[-1] == len(ops) - 1
+                expected_end = (((44 + y) & 255) << 8) | 0xE1
+                if 44 + y == 255 and 44 + args.height > 256:
+                    expected_end = max(expected_end, 0xFFDF)
+                assert ops[-1] == (expected_end, 0xFFFE)
+                visible = ops[waits[0] + 1:waits[1]]
             assert len(visible) == len(slots), 'Visible MOVE schedule changed'
 
             def move(op):
@@ -92,6 +109,8 @@ def main():
 
             for op in ops[:waits[0]]:
                 move(op)
+            if is_lores:
+                assert registers[0] == 0, 'COLOR00 not black in the left border'
             slot = 0
             held = registers[0]
             for x in range(320):
@@ -126,6 +145,10 @@ def main():
                                 for bit in range(3))
                     color = registers[8 + index if index else 0]
                 rendered.append(tuple(((color >> shift) & 15) * 17 for shift in (8, 4, 0)))
+            if is_lores:
+                if frame_color0:
+                    move((0x180, 0))
+                assert registers[0] == 0, 'COLOR00 not black in the right border'
         with Image.open(preview) as image:
             assert image.width % 320 == 0 and image.height % args.height == 0
             sx, sy = image.width // 320, image.height // args.height

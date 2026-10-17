@@ -4552,15 +4552,20 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
             const std::size_t H = result.rendered.height();
             result.scanline_palettes.resize(H);
             auto running = result.palette;
+            // Lores slot 0 lands exactly at x=0 (and loads COLOR00 when it
+            // is unlocked), so the line-start palette includes it.
+            auto starts_visible_line = [&](const strips::ScapMove& mv) {
+                if (strips_lores) return mv.kind == strips::ScapOpKind::kMove && mv.slot_index > 0;
+                return mv.kind == strips::ScapOpKind::kWait;
+            };
             for (std::size_t y = 0; y < H && y < result.strips_line_moves.size(); ++y) {
                 bool snapped = false;
                 for (auto& mv : result.strips_line_moves[y]) {
-                    if (mv.kind == strips::ScapOpKind::kWait) {
-                        if (!snapped) {
-                            result.scanline_palettes[y] = running;
-                            snapped = true;
-                        }
-                    } else if (mv.reg < running.size()) {
+                    if (starts_visible_line(mv) && !snapped) {
+                        result.scanline_palettes[y] = running;
+                        snapped = true;
+                    }
+                    if (mv.kind == strips::ScapOpKind::kMove && mv.reg < running.size()) {
                         running[mv.reg] = palette::ocs_to_linear(mv.rgb_ocs);
                     }
                 }
@@ -6063,6 +6068,7 @@ ConvertResult convert_cheader(const std::uint8_t* input_data,
         ch_opts.strips_label = std::string(variant->label);
         ch_opts.strips_anchor_hpos = variant->table->line_gate_hpos;
         ch_opts.strips_total_planes = variant->table->total_planes;
+        ch_opts.strips_display_shift = variant->table->display_shift_px;
     }
     auto header = cheader::generate(result->planes, result->palette, result->mode, ch_opts);
     if (!header) return make_error(header.error().message);
@@ -6209,6 +6215,7 @@ ConvertResult convert_viewer(const std::uint8_t* input_data,
         ch_opts.strips_label = std::string(variant->label);
         ch_opts.strips_anchor_hpos = variant->table->line_gate_hpos;
         ch_opts.strips_total_planes = variant->table->total_planes;
+        ch_opts.strips_display_shift = variant->table->display_shift_px;
         ch_opts.fade_in = false;  // strips carries its own per-line palette
     }
     auto viewer = cheader::generate_viewer(planes, result->palette, result->mode, ch_opts);

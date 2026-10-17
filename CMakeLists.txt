@@ -1104,7 +1104,7 @@ sys.exit(0 if got==expect else (print(f'expected {expect}, got {got}') or 1))"
                          PROPERTIES DEPENDS "smoke-ham6-strips-h")
 
     # Plain lores + STRIPS (1-4 planes, 8-px slot grid): the .h carries the
-    # strips_lores_ocs copper list, one 39-MOVE chain per row.
+    # strips_lores_ocs copper list, one 40-slot chain per row.
     add_test(
         NAME "smoke-lores-strips-h"
         COMMAND png2amiga --mode lores --depth 3 --sliced --slice-changes 7 --strips
@@ -1115,7 +1115,7 @@ sys.exit(0 if got==expect else (print(f'expected {expect}, got {got}') or 1))"
         NAME "smoke-lores-strips-h-content"
         COMMAND ${PNG2AMIGA_PYTHON} -c
             "content = open('${CMAKE_BINARY_DIR}/lores-strips.h').read(); \
-            assert 'strips_lores_ocs (anchor=0x3E' in content, 'strips_lores_ocs label missing'; \
+            assert 'strips_lores_ocs (anchor=0x3C' in content, 'strips_lores_ocs label missing'; \
             assert 'lstrips_strips_copper_list' in content, 'strips copper list missing'"
     )
     set_tests_properties("smoke-lores-strips-h-content"
@@ -2965,21 +2965,28 @@ sys.exit(0 if ok else 1)")
     endforeach()
 
     # Plain lores strips, 1-4 planes on the 8-px grid (Copperline-calibrated).
-    foreach(_case IN ITEMS "d1" "d2" "d3" "d4" "budget" "early" "late" "tall" "no-lock")
+    # Every case checks the black frame (COLOR00 black outside x=0..319);
+    # "-u" cases leave colour 0 unlocked.
+    foreach(_case IN ITEMS "d1" "d2" "d3" "d4" "d2-u" "d3-u" "d4-u" "budget" "budget-u"
+                           "early-u" "late-u" "tall-u" "early" "late")
         set(_replay_args)
         set(_replay_options --depth 3)
-        if(_case MATCHES "^d([1-4])$")
-            set(_replay_options --depth ${CMAKE_MATCH_1} --expect-black-border)
-        elseif(_case STREQUAL "budget")
+        if(_case MATCHES "^d([1-4])(-u)?$")
+            set(_replay_options --depth ${CMAKE_MATCH_1})
+            if(NOT CMAKE_MATCH_2)
+                list(APPEND _replay_options --expect-black-border)
+            endif()
+        elseif(_case MATCHES "^budget")
             set(_replay_args --slice-changes 7)
-        elseif(_case STREQUAL "early")
+        elseif(_case MATCHES "^early")
             list(APPEND _replay_options --slot-shift -1)
-        elseif(_case STREQUAL "late")
+        elseif(_case MATCHES "^late")
             list(APPEND _replay_options --slot-shift 1)
-        elseif(_case STREQUAL "tall")
+        elseif(_case MATCHES "^tall")
             list(APPEND _replay_options --height 249 --slot-shift 1)
-        elseif(_case STREQUAL "no-lock")
-            set(_replay_args --no-lock-color0)
+        endif()
+        if(_case MATCHES "-u$")
+            list(APPEND _replay_args --no-lock-color0)
         endif()
         add_test(NAME "lores-strips-replay-${_case}"
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py

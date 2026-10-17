@@ -513,9 +513,11 @@ float lab_error(const color_space::OKLab& a, const color_space::OKLab& b) {
 //          COLOR08 for AGA PF2OF=011); index k>0 → COLOR(8+k). Planes are
 //          expanded to 6-plane DPF with PF1 zero.
 //   plain: OCS lores, index k → COLORk.
-// max_hblank_moves caps the per-line reset. Lores: 13 measured on
-// Copperline; 14 delays the 39-MOVE chain by 2 CCK and the late chain end
-// cascades into the next line.
+// max_hblank_moves caps the per-line reset. Lores: 14, measured on
+// Copperline (320x256, depth 4) with the 40-MOVE chain; 15 starts the
+// chain late and the late chain end cascades into the next line. The
+// right-border COLOR00 restore (unlocked colour 0) ends the chain one MOVE
+// later and costs one hblank MOVE: 13.
 struct IndexedLayout {
     const ScapSlotTable* table;
     bool dpf;
@@ -523,7 +525,7 @@ struct IndexedLayout {
 };
 constexpr IndexedLayout kDpfLayout{
     &kStrips6bplOcs, true, copper::max_changes_per_line(3, false, false, amiga::Chipset::ocs)};
-constexpr IndexedLayout kLoresLayout{&kStrips4bplLores, false, 13};
+constexpr IndexedLayout kLoresLayout{&kStrips4bplLores, false, 14};
 
 // Registers to write for palette index k (-1 = unused entry).
 constexpr std::array<int, 2> layout_regs(const IndexedLayout& layout, std::size_t k) {
@@ -712,13 +714,20 @@ static Result<ScapResult> encode_strips_indexed(
     };
     // The hblank reset re-emits every index each line (DPF: 9 MOVEs, k=0
     // dual-writes COLOR00+COLOR08; lores: 2^depth MOVEs) while that fits
-    // the hblank budget (DPF 14, lores 13). Lores depth 4 (16 MOVEs) does
-    // not fit and falls back to the top-N partial reset at the full budget.
+    // the hblank budget (DPF 14, lores 14 or 13). Lores depth 4 (16 or 15
+    // MOVEs) does not fit and falls back to the top-N partial reset at the
+    // full budget.
     // strips swaps live in the visible region and don't contend for
     // hblank, so no strips share split is needed.
-    const std::size_t kMaxCombined = layout.max_hblank_moves;
+    // Lores without --lock-color0: COLOR00 holds an image colour but is
+    // also the border colour, so it stays black outside the picture. The
+    // hblank reset never writes it, slot 0 (x=0) loads it and a MOVE at
+    // x=320 restores black; that MOVE costs one hblank MOVE.
+    const bool frame_color0 = !layout.dpf && !lock_color0;
+    const std::size_t kMaxCombined = layout.max_hblank_moves - (frame_color0 ? 1u : 0u);
+    const std::size_t k_hblank = frame_color0 ? 1u : 0u;  // first hblank index
     std::size_t full_reset_cost = 0;
-    for (std::size_t k = 0; k < kBaseColors; ++k)
+    for (std::size_t k = k_hblank; k < kBaseColors; ++k)
         for (int reg : pf2_writes(k))
             full_reset_cost += (reg >= 0) ? 1u : 0u;
     const bool full_reset = copper_changes_override == 0 && full_reset_cost <= kMaxCombined;
@@ -988,9 +997,10 @@ static Result<ScapResult> encode_strips_indexed(
             //   target, ignore strips residue) is good enough that rows
             //   stay independent for parallel_for.
             std::array<bool, kBaseColors> emitted{};
+            emitted[0] = frame_color0;  // slot 0 loads it at x=0
             if (full_reset) {
                 // Full reset path (default; DPF 9 hblank MOVEs).
-                for (std::size_t k = 0; k < kBaseColors; ++k) {
+                for (std::size_t k = k_hblank; k < kBaseColors; ++k) {
                     auto regs = pf2_writes(k);
                     for (int reg : regs) {
                         if (reg < 0) continue;
@@ -1018,6 +1028,7 @@ static Result<ScapResult> encode_strips_indexed(
                 for (auto& d : diffs) {
                     if (d.second <= 0.0f) break;  // no further differences
                     auto k = static_cast<std::size_t>(d.first);
+                    if (k < k_hblank) continue;
                     auto regs = pf2_writes(k);
                     std::size_t cost = (regs[1] >= 0) ? 2 : 1;  // DPF k=0 dual-write
                     if (move_cost + cost > hblank_budget) continue;
@@ -1228,6 +1239,8 @@ static Result<ScapResult> encode_strips_indexed(
                 next.clear();
                 auto& st = strips[s + 1];
                 bool strip_empty = (strip_pixels_lab[s + 1].empty());
+                // frame_color0: slot 0 is reserved for the COLOR00 load.
+                const bool slot_pinned = frame_color0 && s == 0;
 
                 for (auto& state : beam) {
                     double filler_err = strip_empty ? 0.0 : strip_err_dither(s + 1, state.P_lab);
@@ -1243,7 +1256,7 @@ static Result<ScapResult> encode_strips_indexed(
                         child.rank_err = child.cum_err + future_err;
                         next.push_back(child);
                     }
-                    if (strip_empty) continue;
+                    if (strip_empty || slot_pinned) continue;
 
                     // Per-strip dither error candidate scoring. EHB-style
                     // pixel_min_excl_k cache: for each candidate slot k,
@@ -1475,7 +1488,10 @@ static Result<ScapResult> encode_strips_indexed(
             }
             for (std::size_t s = 0; s < table.slots.size(); ++s) {
                 int reg = best.dec_reg[s];
-                if (reg < 0) {
+                if (frame_color0 && s == 0) {
+                    line_moves[y].push_back(
+                        make_move(0, palette::linear_to_ocs(P[0]), static_cast<int>(s)));
+                } else if (reg < 0) {
                     line_moves[y].push_back(make_move(kFillerReg, kFillerVal, static_cast<int>(s)));
                 } else {
                     auto reg_idx = static_cast<std::size_t>(reg);
@@ -1492,9 +1508,13 @@ static Result<ScapResult> encode_strips_indexed(
                 strip_pal_lab[s + 1] = P_lab;
             }
 
-            // 4. End-of-line WAIT — release copper to the next line's section.
-            line_moves[y].push_back(
-                make_wait(static_cast<std::uint8_t>(table.end_of_line_hpos), vp, -1));
+            // 4. frame_color0: COLOR00 back to black at x=320, the right
+            // border. End-of-line WAIT (if the table has one) releases the
+            // copper to the next line's section.
+            if (frame_color0) line_moves[y].push_back(make_move(0, 0x0000, -1));
+            if (table.end_of_line_wait)
+                line_moves[y].push_back(
+                    make_wait(static_cast<std::uint8_t>(table.end_of_line_hpos), vp, -1));
 
             // Carry P forward as next-line hw_state — captures every
             // emitted sliced MOVE + every applied strips swap. Only writes
@@ -1647,6 +1667,7 @@ static Result<ScapResult> encode_strips_indexed(
     // the forced-zero per-line MOVEs this means the viewer's frame-init
     // writes black to every register and only strips MOVEs change colors.
     std::vector<Color3f> output_palette(layout.dpf ? 16 : kBaseColors, Color3f{0.0f, 0.0f, 0.0f});
+    // frame_color0: the frame starts with COLOR00 black (top border).
     if (!debug_overlay) {
         for (std::size_t k = 0; k < kBaseColors; ++k) {
             auto regs = pf2_writes(k);
@@ -1655,6 +1676,7 @@ static Result<ScapResult> encode_strips_indexed(
                 output_palette[static_cast<std::size_t>(reg)] = base_palette[k];
             }
         }
+        if (frame_color0) output_palette[0] = Color3f{0.0f, 0.0f, 0.0f};
     }
 
     // ---- 5b. Optional PF1 ruler markers (slot-tuning aid) ---------------
@@ -1957,8 +1979,9 @@ static Result<ScapResult> encode_scap_stripes_debug(const ScapSlotTable& table,
                 make_move(static_cast<std::uint8_t>(stripe_reg), v, static_cast<int>(s)));
         }
         // End-of-line WAIT.
-        line_moves[y].push_back(
-            make_wait(static_cast<std::uint8_t>(table.end_of_line_hpos), vp, -1));
+        if (table.end_of_line_wait)
+            line_moves[y].push_back(
+                make_wait(static_cast<std::uint8_t>(table.end_of_line_hpos), vp, -1));
     }
 
     // Build a rendered preview matching what the planner expects: every

@@ -83,6 +83,10 @@ struct CHeaderOptions {
     std::string strips_label;
     int strips_anchor_hpos = 0;
     int strips_total_planes = 0;
+    // ScapSlotTable::display_shift_px: the viewer shows the bitplanes this
+    // many lores pixels left of the standard placement (extra fetch word,
+    // BPLCON1 delay 16-shift, BPLxMOD -2, DIW H -shift). 0 = standard.
+    int strips_display_shift = 0;
 
     // Multi-frame viewer (--batch --batch-format cpp). When non-empty, the
     // viewer emits one bitplane data array per frame (including the primary

@@ -64,6 +64,13 @@ struct ScapSlotTable {
     int line_gate_hpos{};    // WAIT(hp=this, vp=N) opens the strips chain
     int end_of_line_hpos{};  // WAIT(hp=this, vp=N) closes the chain
     std::vector<ScapSlot> slots;
+    // false: the chain always runs past the end of its line, so no
+    // end-of-line WAIT is emitted (one on line 255 would never match).
+    bool end_of_line_wait{true};
+    // Lores pixels the viewer moves the bitplanes left (one extra fetch
+    // word + BPLCON1 delay 16-shift, DIW moved with them) so copper MOVE
+    // landings fall exactly on the slot grid. 0 = standard placement.
+    int display_shift_px{};
 };
 
 // kStrips6bplOcs — OCS DPF, 6 bitplanes, lores 320 px display.
@@ -190,24 +197,33 @@ inline const ScapSlotTable kStrips6bplHam6{
 // plane count does not change the timing for 1-4 planes.
 //
 // Calibrated on Copperline (A500 OCS, 68000) with --strips-debug, where
-// each stripe edge is one MOVE landing. MOVE k lands at x = 8k-13 for
-// gate 0x38, 8k-9 for 0x3A, 8k-5 for 0x3C and 8k-1 for 0x3E: a landing
-// moves in 4-px steps, so the grid can only sit at 8k-1 or 8k+3.
-// 39 slots, not 40: a 40-MOVE chain from 0x3C or later ends after the
-// line wraps, so line 255's end-of-line WAIT (VP $FF) is checked on line
-// 256 (VP $00) and the copper stalls for the rest of the frame. 39 MOVEs
-// from 0x3E end with the same margin as the working 40-from-0x3A chain.
-// Slot 0 (preload) lands at x=-1, slot k>0 at x = 8k-1.
+// each stripe edge is one MOVE landing. With standard bitplane placement,
+// MOVE k lands at x = 8k-13 / 8k-9 / 8k-5 / 8k-1 for gate 0x38 / 0x3A /
+// 0x3C / 0x3E: 4-px steps that never reach x = 8k. The viewer moves the
+// bitplanes 5 px left (display_shift_px), so gate 0x3C lands MOVE k at
+// exactly x = 8k: slot 0 at x=0, slot 39 at x=312, and the unlocked-
+// COLOR00 restore after it at x=320, the first right-border pixel.
+// Gate 0x3E with a 1-px shift gives the same grid, but there the restore
+// is the MOVE that crosses the line end and lands one copper cycle late
+// (x=324).
+//
+// The chain always runs past the end of its line, so there is no
+// end-of-line WAIT: on line 255 one (VP $FF) would be checked on line 256
+// (VP $00) and stall the copper for the rest of the frame.
 inline const ScapSlotTable kStrips4bplLores{
     /*total_planes=*/4,
-    /*line_gate_hpos=*/0x3E,
-    /*end_of_line_hpos=*/0xE1,
+    /*line_gate_hpos=*/0x3C,
+    /*end_of_line_hpos=*/0,
     /*slots=*/
     {
-        {0},   {7},   {15},  {23},  {31},  {39},  {47},  {55},  {63},  {71},  {79},  {87},  {95},
-        {103}, {111}, {119}, {127}, {135}, {143}, {151}, {159}, {167}, {175}, {183}, {191}, {199},
-        {207}, {215}, {223}, {231}, {239}, {247}, {255}, {263}, {271}, {279}, {287}, {295}, {303},
-    }};
+        {0},   {8},   {16},  {24},  {32},  {40},  {48},  {56},  {64},  {72},
+        {80},  {88},  {96},  {104}, {112}, {120}, {128}, {136}, {144}, {152},
+        {160}, {168}, {176}, {184}, {192}, {200}, {208}, {216}, {224}, {232},
+        {240}, {248}, {256}, {264}, {272}, {280}, {288}, {296}, {304}, {312},
+    },
+    /*end_of_line_wait=*/false,
+    /*display_shift_px=*/5,
+};
 
 // Upper bound on slots per table; planner beam nodes size their per-slot
 // decision arrays from it.
@@ -385,6 +401,11 @@ Result<ScapResult> encode_strips_dpf_ocs(
 // grid and the plain register layout (index k = COLORk). reserved_slots /
 // locked_slots use palette indices 0..2^depth-1 directly. debug_overlay
 // emits the stripe calibration pattern instead of an encode.
+//
+// Without lock_color0, COLOR00 carries an image colour but must stay black
+// outside the picture (it is the border colour): hblank never writes it,
+// slot 0 (x=0) loads it, a MOVE after slot 39 (x=320) restores black, and
+// the frame-start palette has COLOR00 black.
 // ---------------------------------------------------------------------------
 Result<ScapResult> encode_strips_lores_ocs(
     const Image& image,

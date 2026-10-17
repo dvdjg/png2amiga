@@ -76,6 +76,16 @@ void emit_strips_copper_list(std::string& out,
                        options.strips_label.empty() ? "unnamed" : options.strips_label,
                        options.strips_anchor_hpos,
                        options.strips_total_planes);
+    if (const int shift = options.strips_display_shift; shift > 0) {
+        out += std::format(
+            "// Display: bitplanes {0} px left of standard so MOVEs land on the slot "
+            "grid:\n//   DDFSTRT $30, BPLCON1 ${1:02X}, BPLxMOD -2 (one extra "
+            "fetch word), DIWSTRT/DIWSTOP H ${2:02X}/${3:02X}\n",
+            shift,
+            (16 - shift) * 0x11,
+            0x81 - shift,
+            0xC1 - shift);
+    }
 
     std::size_t strips_total_words = 0;
     for (auto& row : moves)
@@ -625,6 +635,8 @@ Result<std::string> generate_viewer(const bitplane::BitplaneData& planes,
     // strips supplies its own per-line copper ops and replaces the sliced
     // emission path. They never compose in the same viewer.
     if (has_scap) has_copper = false;
+    // Strips display shift (see CHeaderOptions::strips_display_shift).
+    const int strips_shift = has_scap ? options.strips_display_shift : 0;
     bool is_lace = options.interlace;
     bool need_fmode3 = ((depth > 6) && has_copper) || (is_hires && depth > 4);
 
@@ -1186,6 +1198,10 @@ Result<std::string> generate_viewer(const bitplane::BitplaneData& planes,
     } else if (is_hires) {
         out += "    *cl++ = offsetof(struct Custom, ddfstrt); *cl++ = 0x003C;  // hires standard\n";
         out += "    *cl++ = offsetof(struct Custom, ddfstop); *cl++ = 0x00D4;\n";
+    } else if (strips_shift > 0) {
+        out += "    *cl++ = offsetof(struct Custom, ddfstrt); *cl++ = 0x0030;  "
+               "// lores, one extra fetch word for the strips display shift\n";
+        out += "    *cl++ = offsetof(struct Custom, ddfstop); *cl++ = 0x00D0;\n";
     } else {
         auto lores_ddfstrt = need_fmode3 ? 0x0030 : 0x0038;
         out += std::format(
@@ -1199,9 +1215,9 @@ Result<std::string> generate_viewer(const bitplane::BitplaneData& planes,
     // VSTART=44 (PAL standard), HSTART=0x81. DIWSTOP=0x2CC1 covers full PAL height.
     out += "    // Display window start/stop — visible area on screen\n";
     out += std::format("    *cl++ = offsetof(struct Custom, diwstrt); "
-                       "*cl++ = ({}<<8)|0x81;  // VSTART={}, HSTART=$81\n",
+                       "*cl++ = ({0}<<8)|0x{1:02X};  // VSTART={0}, HSTART=${1:02X}\n",
                        y_start,
-                       y_start);
+                       0x81 - strips_shift);
     {
         // Close DIWSTOP V at exactly the image bottom so the display window
         // ends there. Stops bitplane DMA at the hardware level — much more
@@ -1214,9 +1230,10 @@ Result<std::string> generate_viewer(const bitplane::BitplaneData& planes,
         auto last_line = y_start + static_cast<int>(field_lines);
         auto stop_v = last_line & 0xFF;
         out += std::format("    *cl++ = offsetof(struct Custom, diwstop); "
-                           "*cl++ = ({}<<8)|0xC1;  // VSTOP={}, HSTOP=$C1\n",
+                           "*cl++ = ({0}<<8)|0x{2:02X};  // VSTOP={1}, HSTOP=${2:02X}\n",
                            stop_v,
-                           last_line);
+                           last_line,
+                           0xC1 - strips_shift);
     }
 
     // FMODE: AGA fetch mode. 0=16-bit (OCS compatible), 3=64-bit (needed
@@ -1258,7 +1275,13 @@ Result<std::string> generate_viewer(const bitplane::BitplaneData& planes,
                        "*cl++ = {};  // 0x{:04X}\n",
                        bplcon0_expr,
                        bplcon0);
-    out += "    *cl++ = offsetof(struct Custom, bplcon1); *cl++ = 0;  // scroll offset = 0\n";
+    if (strips_shift > 0)
+        out += std::format("    *cl++ = offsetof(struct Custom, bplcon1); *cl++ = 0x{:02X};  "
+                           "// delay {} px on both playfields\n",
+                           (16 - strips_shift) * 0x11,
+                           16 - strips_shift);
+    else
+        out += "    *cl++ = offsetof(struct Custom, bplcon1); *cl++ = 0;  // scroll offset = 0\n";
 
     // BPLCON2: playfield priority and KILLEHB
     // Bit 9: KILLEHB — prevents 6-plane non-EHB from triggering Extra Half-Brite
@@ -1314,9 +1337,10 @@ Result<std::string> generate_viewer(const bitplane::BitplaneData& planes,
     // block, so the next row is already at +bpr — no skip, mod = 0.
     // FMODE=3 reads 8 bytes past the visible area as overread, so the
     // pointer has advanced bpr+8 instead of bpr — subtract 8.
+    // The strips display shift fetches one extra word per row: -2.
     int mod = is_batch ? -(need_fmode3 ? 8 : 0)
                        : static_cast<int>(bpr) * (static_cast<int>(depth) * (is_lace ? 2 : 1) - 1) -
-                             (need_fmode3 ? 8 : 0);
+                             (need_fmode3 ? 8 : 0) - (strips_shift > 0 ? 2 : 0);
     out += std::format("    *cl++ = offsetof(struct Custom, bpl1mod); "
                        "*cl++ = {};\n",
                        mod);
