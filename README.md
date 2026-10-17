@@ -573,6 +573,11 @@ Strip modes:
   per-line hblank tracking keeps each line inside the 13-MOVE EHB hblank
   budget. ~1100+ unique displayed colors per frame.
 
+* **HAM6 + strips** (`--mode ham6 --strips`) — OCS HAM6, 16 base
+  registers. Mid-line swaps change the registers that HAM SET pixels
+  load; MODIFY pixels follow the swapped colors. Slots at 16k+7. Each
+  line restores at most 13 registers in hblank.
+
 All strip modes are OCS-only, lores, no interlace. The DPF planner uses a
 64-state beam with two-strip lookahead, allowing a color to be loaded
 before the pixels that need it. It then performs up to four palette
@@ -603,8 +608,13 @@ refinement excludes the guarded register from pixel assignments as well.
 
 HAM6 strips plans scanlines in order because register values carry over
 between lines. Its preview uses the palette actually restored within
-the 13-write hblank limit; this avoids preview/export disagreement at
-the cost of losing the previous row-level parallelism. Progressive
+the 13-write hblank limit, so preview and export agree. Each slot
+takes the best single swap: candidates are ranked by the HAM error a
+SET of that color would remove, and the row's HAM DP scores the top 24
+(at most 4 per register) with a three-strip lookahead. Candidates are
+scored in parallel, and the DP resumes at the first changed pixel. The
+written colors are then refit to the pixels that use them over their
+register lifetimes. Ordered dithers apply to HAM6 strips. Progressive
 sliced and strip viewers wait until `$E1` before next-row palette
 writes, including across line 255; interlaced sliced viewers retain
 `$E3`.
