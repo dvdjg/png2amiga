@@ -595,8 +595,7 @@ new information.
 
 At each write boundary, a guard avoids selecting the register being
 changed (including its half-brite index in EHB). DPF and lores guard one
-pixel on either side (lores slot 0 at x = 0 has no guard); EHB guards three, covering the earlier transitions seen
-in the Amiberry timing probe. Previews and S2 scores include these
+pixel on either side (lores slot 0 at x = 0 has no guard); EHB guards three. Previews and S2 scores include these
 constraints. The DPF and EHB planners also charge the nearest-color error
 caused by these guards on both sides of each proposed write, so they avoid
 swaps whose apparent benefit disappears at the boundary. DPF lifetime
@@ -610,9 +609,9 @@ sliced and strip viewers wait until `$E1` before next-row palette
 writes, including across line 255; interlaced sliced viewers retain
 `$E3`.
 
-Slot positions for the 6-plane modes were calibrated empirically on
-real OCS hardware via `--strips-probe` (see `src/strips.hpp`). The lores
-1-4 plane table was calibrated on the cycle-exact Copperline emulator
+DPF slot positions were calibrated empirically on real OCS hardware via
+`--strips-probe` (see `src/strips.hpp`). The EHB and HAM6 tables (slots
+at 16k+7) and the lores 1-4 plane table were calibrated or verified on the cycle-exact Copperline emulator
 with `--strips-debug`; the published
 hardware budget is ~14 hblank MOVEs + ~20 visible-area MOVEs per line in
 6-plane modes, and the calibrated slot tables sit comfortably within
