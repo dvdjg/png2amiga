@@ -392,6 +392,36 @@ inline bool ends_with(std::string_view s, std::string_view suffix) {
     return s.substr(s.size() - suffix.size()) == suffix;
 }
 
+// The one .idx writer: raw chunky bytes, 1 per pixel, scan order, no
+// header, after the --transparent-output-slot swap. `source` prefixes the
+// open error (the flag that asked for the file); `status` is the label of
+// the status line.
+inline int write_idx_file(std::string_view source,
+                          std::string_view status,
+                          const std::string& path,
+                          std::vector<std::uint8_t> indices,
+                          const std::vector<bool>& tmask,
+                          int swap_slot,
+                          std::size_t w,
+                          std::size_t h) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::println(stderr, "{}: cannot open '{}'", source, path);
+        return exit_code::cant_create;
+    }
+    apply_transparent_slot_swap(indices, tmask, swap_slot);
+    f.write(reinterpret_cast<const char*>(indices.data()),
+            static_cast<std::streamsize>(indices.size()));
+    cli_status("{} {} ({} bytes, {}x{}{})",
+               status,
+               path,
+               indices.size(),
+               w,
+               h,
+               swap_slot > 0 ? std::format(", transparent→slot {}", swap_slot) : std::string{});
+    return 0;
+}
+
 // Resolve --output-each pattern to a concrete path for one input.
 // Tokens: {dir} = parent dir, {stem} = filename without extension,
 // {name} = filename with extension. Bare `.ext` shortcut puts the
@@ -439,22 +469,15 @@ inline int write_oe_outputs(const std::vector<std::string>& patterns,
     for (auto& pat : patterns) {
         auto out_path = resolve_oe_pattern(pat, src);
         if (ends_with(out_path, ".idx")) {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f) {
-                std::println(stderr, "--output-each: cannot open '{}'", out_path);
-                return exit_code::cant_create;
-            }
-            std::vector<std::uint8_t> out_idx(idx_in.begin(), idx_in.end());
-            apply_transparent_slot_swap(out_idx, tmask, swap_slot);
-            f.write(reinterpret_cast<const char*>(out_idx.data()),
-                    static_cast<std::streamsize>(out_idx.size()));
-            cli_status("Joint-out: {} ({} bytes, {}x{}{})",
-                       out_path,
-                       out_idx.size(),
-                       w,
-                       h,
-                       swap_slot > 0 ? std::format(", transparent→slot {}", swap_slot)
-                                     : std::string{});
+            if (auto rc = write_idx_file("--output-each",
+                                         "Joint-out:",
+                                         out_path,
+                                         {idx_in.begin(), idx_in.end()},
+                                         tmask,
+                                         swap_slot,
+                                         w,
+                                         h))
+                return rc;
         } else if (ends_with(out_path, ".png")) {
             std::vector<std::uint8_t> idx_v(idx_in.begin(), idx_in.end());
             std::vector<Color3f> pal_v(palette.begin(), palette.end());
@@ -3973,6 +3996,7 @@ struct AmigaOutputBundle {
     bool dpf = false;
     bool has_transparency = false;
     std::vector<bool> transparency_mask;
+    int transparent_output_slot = 0;  // --transparent-output-slot, .idx only
     std::string output_path;
     std::string symbol_override;
 
@@ -4179,6 +4203,26 @@ int write_amiga_output(AmigaOutputBundle& out) {
         return 0;
     }
 
+    // .idx: each pixel's bitplane value (bit k = plane k), so the palette
+    // index in indexed, sliced and strips modes, HAM control + data bits,
+    // and the combined PF1/PF2 value in DPF. Decoded from the planes the
+    // other formats write, at the image's own size.
+    if (ends_with(path, ".idx")) {
+        auto idx = bitplane::decode(out.planes);
+        if (!idx) {
+            std::println(stderr, "Output: .idx decode error: {}", idx.error().message);
+            return exit_code::internal;
+        }
+        return write_idx_file("Output",
+                              "Indexed:",
+                              path,
+                              *std::move(idx),
+                              out.transparency_mask,
+                              out.transparent_output_slot,
+                              out.planes.width,
+                              out.planes.height);
+    }
+
     // Anything else is not an Amiga output format. Amiga executables come
     // from building the .cpp viewer (build-amiga.sh), not from the CLI.
     if (!ends_with(path, ".png")) {
@@ -4187,7 +4231,7 @@ int write_amiga_output(AmigaOutputBundle& out) {
         } else {
             std::println(stderr,
                          "Output: unsupported extension for '{}' (use .png, .iff/.ilbm, .h, "
-                         ".cpp/.c, .raw/.bin/.bpl or .pal)",
+                         ".cpp/.c, .raw/.bin/.bpl, .pal or .idx)",
                          path);
         }
         return exit_code::usage;
@@ -8694,6 +8738,7 @@ int run_main(int argc, char* argv[]) {
             out.interlace = config->interlace;
             out.has_transparency = has_transparency;
             out.transparency_mask = transparency_mask;
+            out.transparent_output_slot = config->transparent_output_slot;
             out.output_path = config->output_path;
             out.symbol_override = config->symbol_name;
             out.fade_in = config->fade_in;
@@ -8910,6 +8955,7 @@ int run_main(int argc, char* argv[]) {
                 out.interlace = config->interlace;
                 out.has_transparency = has_transparency;
                 out.transparency_mask = transparency_mask;
+                out.transparent_output_slot = config->transparent_output_slot;
                 out.output_path = config->output_path;
                 out.symbol_override = config->symbol_name;
                 out.fade_in = config->fade_in;
@@ -8922,7 +8968,7 @@ int run_main(int argc, char* argv[]) {
                 out.allow_raw = false;
                 out.allow_pal = false;
                 out.disallow_message =
-                    "EHB copper: only .png, .iff, .h, and .cpp/.c output supported";
+                    "EHB copper: only .png, .iff, .h, .cpp/.c and .idx output supported";
                 int rc = write_amiga_output(out);
                 if (rc != 0) return rc;
             }
@@ -9086,6 +9132,7 @@ int run_main(int argc, char* argv[]) {
             out.interlace = config->interlace;
             out.has_transparency = has_transparency;
             out.transparency_mask = transparency_mask;
+            out.transparent_output_slot = config->transparent_output_slot;
             out.output_path = config->output_path;
             out.symbol_override = config->symbol_name;
             out.fade_in = config->fade_in;
@@ -9116,25 +9163,15 @@ int run_main(int argc, char* argv[]) {
         // down; EHB returns early before reaching it, so inline the
         // same logic + --transparent-output-slot swap here.
         if (!config->output_indexed_path.empty() && !st.indices.empty()) {
-            std::ofstream f(config->output_indexed_path, std::ios::binary | std::ios::trunc);
-            if (!f) {
-                std::println(
-                    stderr, "--output-indexed: cannot open '{}'", config->output_indexed_path);
-                return 1;
-            }
-            std::vector<std::uint8_t> out_idx = st.indices;
-            apply_transparent_slot_swap(
-                out_idx, transparency_mask, config->transparent_output_slot);
-            f.write(reinterpret_cast<const char*>(out_idx.data()),
-                    static_cast<std::streamsize>(out_idx.size()));
-            cli_status("Indexed: {} ({} bytes, {}x{}{})",
-                       config->output_indexed_path,
-                       out_idx.size(),
-                       st.rendered.width(),
-                       st.rendered.height(),
-                       config->transparent_output_slot > 0
-                           ? std::format(", transparent→slot {}", config->transparent_output_slot)
-                           : std::string{});
+            if (auto rc = write_idx_file("--output-indexed",
+                                         "Indexed:",
+                                         config->output_indexed_path,
+                                         st.indices,
+                                         transparency_mask,
+                                         config->transparent_output_slot,
+                                         st.rendered.width(),
+                                         st.rendered.height()))
+                return rc;
         }
 
         // Joint --ji / --oe writes (EHB mode): the standard joint
@@ -9571,6 +9608,7 @@ int run_main(int argc, char* argv[]) {
             out.dpf = use_dpf_std;
             out.has_transparency = has_transparency;
             out.transparency_mask = transparency_mask;
+            out.transparent_output_slot = config->transparent_output_slot;
             out.output_path = config->output_path;
             out.symbol_override = config->symbol_name;
             out.fade_in = config->fade_in;
@@ -9743,6 +9781,7 @@ int run_main(int argc, char* argv[]) {
             out.dpf = strips_dpf;
             out.has_transparency = has_transparency;
             out.transparency_mask = transparency_mask;
+            out.transparent_output_slot = config->transparent_output_slot;
             out.output_path = config->output_path;
             out.symbol_override = config->symbol_name;
             out.mask_layout = config->mask_layout;
@@ -9755,7 +9794,7 @@ int run_main(int argc, char* argv[]) {
             out.allow_iff = false;
             out.allow_raw = false;
             out.allow_pal = false;
-            out.disallow_message = "Strips output: only .png, .h, and .cpp/.c supported";
+            out.disallow_message = "Strips output: only .png, .h, .cpp/.c and .idx supported";
             int rc = write_amiga_output(out);
             if (rc != 0) return rc;
         }
@@ -10579,27 +10618,18 @@ int run_main(int argc, char* argv[]) {
     // from the api state. Writes after dither/pin so the bytes match
     // the final palette; runs before the --tile crop so non-tile
     // outputs are unaffected (--tile is excluded from --best anyway).
+    // The swap runs on a copy, so the in-memory indices keep slot 0 =
+    // transparent for later renders / status output.
     if (!config->output_indexed_path.empty() && !dither_result.indices.empty()) {
-        std::ofstream f(config->output_indexed_path, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            std::println(stderr, "--output-indexed: cannot open '{}'", config->output_indexed_path);
-            return 1;
-        }
-        // Apply --transparent-output-slot swap on a copy so the
-        // in-memory indices stay consistent (slot 0 = transparent)
-        // for any subsequent renders / status output.
-        std::vector<std::uint8_t> out_idx = dither_result.indices;
-        apply_transparent_slot_swap(out_idx, transparency_mask, config->transparent_output_slot);
-        f.write(reinterpret_cast<const char*>(out_idx.data()),
-                static_cast<std::streamsize>(out_idx.size()));
-        cli_status("Indexed: {} ({} bytes, {}x{}{})",
-                   config->output_indexed_path,
-                   out_idx.size(),
-                   image->width(),
-                   image->height(),
-                   config->transparent_output_slot > 0
-                       ? std::format(", transparent→slot {}", config->transparent_output_slot)
-                       : std::string{});
+        if (auto rc = write_idx_file("--output-indexed",
+                                     "Indexed:",
+                                     config->output_indexed_path,
+                                     dither_result.indices,
+                                     transparency_mask,
+                                     config->transparent_output_slot,
+                                     image->width(),
+                                     image->height()))
+            return rc;
     }
 
     // Single emit-site for the auto-palette status. See comment ~L7547
@@ -10832,6 +10862,7 @@ int run_main(int argc, char* argv[]) {
             out.dpf = use_dpf_std;
             out.has_transparency = has_transparency;
             out.transparency_mask = transparency_mask;
+            out.transparent_output_slot = config->transparent_output_slot;
             out.output_path = config->output_path;
             out.symbol_override = config->symbol_name;
             out.fade_in = config->fade_in;
@@ -11121,79 +11152,14 @@ int run_main(int argc, char* argv[]) {
     //   {dir}/{base}/{stem}      → printf-style substitution
     // Format is selected by the resolved path's extension.
     if (joint_mode && !config->output_each.empty()) {
-        namespace fs = std::filesystem;
-        auto resolve = [&](const std::string& pat, const std::string& src) -> std::string {
-            fs::path p(src);
-            std::string dir = p.parent_path().string();
-            std::string name = p.filename().string();  // with extension
-            std::string stem = p.stem().string();      // without extension
-            if (!pat.empty() && pat[0] == '.') {
-                fs::path o = dir.empty() ? fs::path(stem + pat) : fs::path(dir) / (stem + pat);
-                return o.string();
-            }
-            std::string out = pat;
-            auto repl = [&](std::string_view tok, std::string_view val) {
-                std::size_t pos = 0;
-                while ((pos = out.find(tok, pos)) != std::string::npos) {
-                    out.replace(pos, tok.size(), val);
-                    pos += val.size();
-                }
-            };
-            repl("{dir}", dir);
-            repl("{stem}", stem);
-            repl("{name}", name);  // rarely useful — filename with ext
-            return out;
-        };
         auto write_outputs = [&](const std::string& src,
                                  std::span<const std::uint8_t> idx,
                                  const std::vector<bool>& tmask,
                                  std::size_t w,
-                                 std::size_t h) -> int {
-            for (auto& pat : config->output_each) {
-                auto out_path = resolve(pat, src);
-                if (ends_with(out_path, ".idx")) {
-                    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-                    if (!f) {
-                        std::println(stderr, "--output-each: cannot open '{}'", out_path);
-                        return exit_code::cant_create;
-                    }
-                    // Apply --transparent-output-slot swap on a copy.
-                    std::vector<std::uint8_t> out_idx(idx.begin(), idx.end());
-                    apply_transparent_slot_swap(out_idx, tmask, config->transparent_output_slot);
-                    f.write(reinterpret_cast<const char*>(out_idx.data()),
-                            static_cast<std::streamsize>(out_idx.size()));
-                    cli_status(
-                        "Joint-out: {} ({} bytes, {}x{}{})",
-                        out_path,
-                        out_idx.size(),
-                        w,
-                        h,
-                        config->transparent_output_slot > 0
-                            ? std::format(", transparent→slot {}", config->transparent_output_slot)
-                            : std::string{});
-                } else if (ends_with(out_path, ".png")) {
-                    std::vector<std::uint8_t> idx_v(idx.begin(), idx.end());
-                    auto r = png_io::save_palettized(out_path,
-                                                     idx_v,
-                                                     pal.colors,
-                                                     w,
-                                                     h,
-                                                     /*transparent_index=*/-1);
-                    if (!r) {
-                        std::println(
-                            stderr, "--output-each: PNG write error: {}", r.error().message);
-                        return exit_code::cant_create;
-                    }
-                    cli_status("Joint-out: {} (paletted, {}x{})", out_path, w, h);
-                } else {
-                    std::println(stderr,
-                                 "--output-each: unsupported extension "
-                                 "in '{}' (expected .idx or .png)",
-                                 out_path);
-                    return exit_code::usage;
-                }
-            }
-            return 0;
+                                 std::size_t h) {
+            return write_oe_outputs(
+                config->output_each, src, idx, tmask, pal.colors, w, h,
+                config->transparent_output_slot);
         };
         // Positional first — its indices were already produced by
         // the main encode pipeline. Per-input dither for the rest.

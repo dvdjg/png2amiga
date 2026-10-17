@@ -4,7 +4,8 @@
 Uses the established 320px OCS slot calibration, not a cycle-level emulator.
 Checks export/preview agreement and the fixed copper instruction budget.
 Lores additionally checks the black frame: COLOR00 is black at frame start,
-in hblank and after x=319 on every line.
+in hblank and after x=319 on every line. --check-idx also writes -o .idx and
+requires each byte to be the bitplane value the replay renders that pixel from.
 """
 import argparse
 from pathlib import Path
@@ -34,6 +35,7 @@ def main():
     parser.add_argument('--expect-black-border', action='store_true')
     parser.add_argument('--height', type=int, default=200)
     parser.add_argument('--slot-shift', type=int, choices=range(-3, 4), default=0)
+    parser.add_argument('--check-idx', action='store_true')
     parser.add_argument('extra', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     extra = args.extra[1:] if args.extra[:1] == ['--'] else args.extra
@@ -52,14 +54,19 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         header = Path(directory) / 'image.h'
         preview = Path(directory) / 'image.png'
+        chunky = Path(directory) / 'image.idx'
         mode_flags = {'dpf': ['--mode', 'lores', '--dpf'],
                       'lores': ['--mode', 'lores', '--depth', str(args.depth)]}.get(
                           args.mode, ['--mode', args.mode])
         command = [args.cli, *mode_flags, '--strips',
                    '--width', '320', '--height', str(args.height), '--symbol', 'replay', *extra]
-        for output in (header, preview):
+        outputs = (header, preview, chunky) if args.check_idx else (header, preview)
+        for output in outputs:
             subprocess.run([*command, args.source, str(output)], check=True, capture_output=True)
         text = header.read_text()
+        idx = chunky.read_bytes() if args.check_idx else None
+        if idx is not None:
+            assert len(idx) == 320 * args.height, f'.idx has {len(idx)} bytes'
 
         def array(name):
             return words(re.search(r'\b' + name + r'\[.*?\]\s*=\s*\{(.*?)\};',
@@ -122,6 +129,10 @@ def main():
                     slot += 1
                 word = y * 20 + x // 16
                 shift = 15 - x % 16
+                if idx is not None:
+                    value = sum(((planes[bit][word] >> shift) & 1) << bit
+                                for bit in range(plane_count))
+                    assert idx[y * 320 + x] == value, f'.idx differs at ({x}, {y})'
                 if is_ham:
                     value = sum(((planes[bit][word] >> shift) & 1) << bit for bit in range(6))
                     ctrl, data = value >> 4, value & 15
@@ -164,7 +175,8 @@ def main():
         assert len(actual) == len(rendered)
         assert mismatches == 0, f'{mismatches} preview pixels differ from exported hardware colors'
         print(f'PASS ({args.mode}): {320 * args.height} pixels match exported bitplanes/copper '
-              f'(slot shift {args.slot_shift:+d}); write budget unchanged')
+              f'(slot shift {args.slot_shift:+d}); write budget unchanged'
+              + ('; .idx matches' if idx is not None else ''))
 
 
 if __name__ == '__main__':

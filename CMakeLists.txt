@@ -1137,6 +1137,13 @@ sys.exit(0 if got==expect else (print(f'expected {expect}, got {got}') or 1))"
                 ${CMAKE_BINARY_DIR}/amiga-output.exe
     )
     set_tests_properties("amiga-output-rejects-exe" PROPERTIES WILL_FAIL TRUE)
+    # -o x.idx writes 1 byte per pixel (the bitplane value) in every Amiga
+    # path: plain, sliced, strips and HAM.
+    add_test(
+        NAME "amiga-output-idx"
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_idx_output.py
+                --cli $<TARGET_FILE:png2amiga>
+    )
 
     # --tile: pre-replicate input 3x3, run pipeline, crop centre. Verify
     # that the encoded .h has the requested centre dimensions (W x H,
@@ -2964,6 +2971,8 @@ sys.exit(0 if ok else 1)")
         elseif(_case STREQUAL "dbs-early")
             set(_replay_options --slot-shift -1)
             set(_replay_args --dither dbs)
+        elseif(_case STREQUAL "default")
+            set(_replay_options --check-idx)
         endif()
         add_test(NAME "dpf-strips-replay-${_case}"
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py
@@ -2997,6 +3006,9 @@ sys.exit(0 if ok else 1)")
         if(_case MATCHES "-u$")
             list(APPEND _replay_args --no-lock-color0)
         endif()
+        if(_case MATCHES "^d3")
+            list(APPEND _replay_options --check-idx)
+        endif()
         add_test(NAME "lores-strips-replay-${_case}"
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py
                 --mode lores --cli $<TARGET_FILE:png2amiga>
@@ -3025,6 +3037,8 @@ sys.exit(0 if ok else 1)")
             set(_replay_args --reserve-range 1-31 ff00ff)
         elseif(_case STREQUAL "budget")
             set(_replay_args --slice-changes 3)
+        elseif(_case STREQUAL "default")
+            set(_replay_options --check-idx)
         endif()
         add_test(NAME "ehb-strips-replay-${_case}"
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py
@@ -3053,16 +3067,19 @@ sys.exit(0 if ok else 1)")
     foreach(_case IN ITEMS "default" "budget" "tall")
         set(_ham_height 16)
         set(_ham_args)
+        set(_ham_options)
         if(_case STREQUAL "budget")
             set(_ham_args --slice-changes 3)
         elseif(_case STREQUAL "tall")
             set(_ham_height 213)
+        else()
+            set(_ham_options --check-idx)
         endif()
         add_test(NAME "ham6-strips-replay-${_case}"
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_strips_replay.py
                 --mode ham6 --expect-black-border --cli $<TARGET_FILE:png2amiga>
                 --in ${CMAKE_SOURCE_DIR}/examples/maui.jpg --height ${_ham_height}
-                -- ${_ham_args})
+                ${_ham_options} -- ${_ham_args})
     endforeach()
 
     foreach(_case IN ITEMS "ocs" "aga-hires" "lace")
