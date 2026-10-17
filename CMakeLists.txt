@@ -2966,14 +2966,14 @@ sys.exit(0 if ok else 1)")
 
     # Plain lores strips, 1-4 planes on the 8-px grid (Copperline-calibrated).
     # Every case checks the black frame (COLOR00 black outside x=0..319);
-    # "-u" cases leave colour 0 unlocked.
+    # "-u" cases leave colour 0 unlocked (depth 1 always is).
     foreach(_case IN ITEMS "d1" "d2" "d3" "d4" "d2-u" "d3-u" "d4-u" "budget" "budget-u"
                            "early-u" "late-u" "tall-u" "early" "late")
         set(_replay_args)
         set(_replay_options --depth 3)
         if(_case MATCHES "^d([1-4])(-u)?$")
             set(_replay_options --depth ${CMAKE_MATCH_1})
-            if(NOT CMAKE_MATCH_2)
+            if(NOT CMAKE_MATCH_2 AND NOT CMAKE_MATCH_1 STREQUAL "1")
                 list(APPEND _replay_options --expect-black-border)
             endif()
         elseif(_case MATCHES "^budget")

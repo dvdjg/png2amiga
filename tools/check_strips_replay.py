@@ -43,8 +43,8 @@ def main():
     is_lores = args.mode == 'lores'
     slots = {'ham6': tuple(range(7, 296, 16)), 'ehb': tuple(range(9, 282, 16)),
              'dpf': SLOTS, 'lores': LORES_SLOTS}[args.mode]
-    # Lores colour 0 is unlocked with --no-lock-color0.
-    frame_color0 = is_lores and '--no-lock-color0' in extra
+    # Lores colour 0 is unlocked with --no-lock-color0 and always at depth 1.
+    frame_color0 = is_lores and ('--no-lock-color0' in extra or args.depth == 1)
     gate_hpos, hblank_budget = {'dpf': (0x38, 14),
                                 'lores': (0x3C, 13 if frame_color0 else 14)}.get(args.mode,
                                                                                  (0x3C, 13))

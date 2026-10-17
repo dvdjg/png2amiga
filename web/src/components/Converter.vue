@@ -1281,6 +1281,22 @@ watch(() => supportsCellRefine(options), (supported) => {
   if (!supported) options.cellRefine = false
 })
 
+// Lores strips at depth 1 has two colours; reserving colour 0 for black
+// would leave one, so the encoder forces the lock off (matches api.cpp).
+// The user's setting comes back when the override ends.
+const color0LockForcedOff = computed(() =>
+  options.scap && options.mode === 'lores' && !options.dualPlayfield && options.depth === 1)
+let lockColor0BeforeForce: boolean | null = null
+watch(color0LockForcedOff, (forced) => {
+  if (forced) {
+    lockColor0BeforeForce = options.lockColor0
+    options.lockColor0 = false
+  } else if (lockColor0BeforeForce !== null) {
+    options.lockColor0 = lockColor0BeforeForce
+    lockColor0BeforeForce = null
+  }
+}, { immediate: true })
+
 watch(() => [requiresCellRefineDiffusion(options), options.dither], () => {
   if (requiresCellRefineDiffusion(options) && !isErrorDiffusion(options.dither)) {
     options.dither = 'floyd-steinberg'
@@ -3114,7 +3130,7 @@ async function loadExample(example: typeof EXAMPLES[number]) {
               <!-- Reserve color 0 -->
               <div class="pt-3 mt-3 border-top-1 surface-border">
                 <div class="flex align-items-center gap-2">
-                  <input type="checkbox" v-model="options.lockColor0" id="lockColor0" />
+                  <input type="checkbox" v-model="options.lockColor0" id="lockColor0" :disabled="color0LockForcedOff" />
                   <label for="lockColor0" class="text-xs text-color-secondary" title="Reserve palette index 0 for black (Amiga border/background color). Disable to use all palette slots for image colors.">Reserve color 0 for black</label>
                 </div>
               </div>

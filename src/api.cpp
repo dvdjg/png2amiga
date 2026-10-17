@@ -1334,6 +1334,8 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         amiga::is_genesis(mode) || amiga::is_gba(mode) || (amiga::is_thomson(mode) || amiga::is_msx(mode) || amiga::is_retro_raster(mode)) ||
         amiga::is_ted(mode) || amiga::is_sms(mode) || amiga::is_cpc(mode))
         depth = amiga::get_mode_params(mode).bitplane_depth;
+    if (options.scap && strips::strips_forces_color0_unlocked(mode, options.dual_playfield, depth))
+        options.lock_color0 = false;
 
     // Dual-playfield: encode the image into PF2 only with a constrained
     // sub-depth (3 OCS / 4 AGA). The remaining planes (PF1 = foreground)

@@ -267,6 +267,12 @@ inline const StripsVariant* strips_variant_for(amiga::Mode mode, bool dpf) {
     return nullptr;
 }
 
+// Lores strips at depth 1 has two colours; reserving COLOR00 for black
+// would leave one, so the colour-0 lock is forced off.
+constexpr bool strips_forces_color0_unlocked(amiga::Mode mode, bool dpf, std::size_t depth) {
+    return mode == amiga::Mode::lores && !dpf && depth == 1;
+}
+
 // ---------------------------------------------------------------------------
 // One copper instruction emitted into the per-line list.
 // ---------------------------------------------------------------------------
@@ -405,7 +411,8 @@ Result<ScapResult> encode_strips_dpf_ocs(
 // Without lock_color0, COLOR00 carries an image colour but must stay black
 // outside the picture (it is the border colour): hblank never writes it,
 // slot 0 (x=0) loads it, a MOVE after slot 39 (x=320) restores black, and
-// the frame-start palette has COLOR00 black.
+// the frame-start palette has COLOR00 black. Callers force lock_color0
+// off at depth 1 (strips_forces_color0_unlocked).
 // ---------------------------------------------------------------------------
 Result<ScapResult> encode_strips_lores_ocs(
     const Image& image,

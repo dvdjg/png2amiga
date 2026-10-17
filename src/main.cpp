@@ -9600,6 +9600,9 @@ int run_main(int argc, char* argv[]) {
             return 1;
         }
         const auto* variant = strips::strips_variant_for(config->mode, strips_dpf);
+        if (strips::strips_forces_color0_unlocked(
+                config->mode, config->dual_playfield, config->depth))
+            config->lock_color0 = false;
         if (has_transparency) {
             for (std::size_t i = 0; i < transparency_mask.size(); ++i)
                 if (transparency_mask[i]) image->pixels()[i] = Color3f{0, 0, 0};
