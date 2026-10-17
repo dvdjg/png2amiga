@@ -3432,7 +3432,7 @@ Result<ScapResult> encode_strips_ham6_ocs(const Image& image,
         }};
     }
 
-    constexpr std::size_t kBaseColors = 16;
+    static constexpr std::size_t kBaseColors = 16;
     constexpr std::size_t kHblankCeiling = 13;  // MOVEs sliced can land
                                                 // in hblank.
     constexpr std::size_t kVisibleBudget = 18;  // MOVEs strips can land
