@@ -240,8 +240,23 @@ void refine_scanline_triple_per_strip(std::vector<std::uint8_t>& values,
 //
 // Default is oklab2; --ham-metric srgb-mse selects the headline-PSNR
 // scorer for the rare "I need to win published-PSNR" use case.
+//
+// Two extra scorers are available for experimentation:
+//  - abc342: the empirical RGB weights used by Leonard's abc converter
+//    (3*dr² + 4*dg² + 2*db² on 4-bit-level deltas). Cheap, tuned on real
+//    HAM output rather than on a color-appearance model.
+//  - oklab_lum: OKLab² with the lightness axis weighted 4x. Prioritises
+//    brightness over chroma, approximating the "smooth value ramp first"
+//    idea (HSV-ish) without an HSV conversion per candidate.
 // ---------------------------------------------------------------------------
-enum class HamMetric { srgb_mse, oklab2 };
+enum class HamMetric { srgb_mse, oklab2, abc342, oklab_lum };
+
+// Whether a metric scores candidates through their OKLab coordinates
+// (true) or their sRGB triple (false). Used to pick the scoring path
+// inside the templated encoders.
+constexpr bool metric_uses_lab(HamMetric m) noexcept {
+    return m == HamMetric::oklab2 || m == HamMetric::oklab_lum;
+}
 
 // ---------------------------------------------------------------------------
 // HAM encoding options
@@ -282,6 +297,19 @@ struct HamOptions {
     // since the optimized inner loop makes the extra ~1ms/frame
     // cheap for the ~0.5-1 dB blurred-PSNR gain.
     std::size_t triple_beam = 16;
+
+    // Smoothness prior for the DP encoder (0 = off). Adds an extra
+    // penalty to each candidate op when its output colour jumps farther
+    // from the previous output pixel than the *source* does locally:
+    //   penalty = weight * max(0, d(out, prev_out) - d(ref[x], ref[x-1]))
+    // with d in the active metric (OKLab2 or sRGB-MSE). On soft
+    // gradients this favours one-step MODIFY transitions instead of
+    // jumping to a distant SET colour; on real edges the source's own
+    // large jump keeps the penalty at zero. The reference row is the
+    // original (pre-dither) scanline, so dither noise does not weaken
+    // the prior. Requires the DP encoder (ignored/rejected with
+    // --ham-fast and palette-aware HAM dithers).
+    float smooth_transitions = 0.0f;
 
     // Greedy encoder — bypasses the DP beam search entirely. Each pixel
     // picks the locally best HAM op (nearest SET + best single MODIFY per

@@ -120,6 +120,35 @@ This also applies to sliced and striped HAM6; AGA colors retain all 24 bits.
 `--ham-fast` switches to the greedy encoder (~15× faster, ~0.04 dB
 quality cost) for live preview or batch video processing.
 
+**`--ham-smooth <0-8>`** adds a smoothness prior to the DP encoder: a
+candidate op whose colour jumps farther from the previous output pixel
+than the *source* does locally (original scanline, pre-dither) pays an
+extra penalty. On soft gradients the encoder is pushed toward one-step
+MODIFY transitions instead of jumping to a distant SET colour, which
+keeps beach/sky ramps from banding; the prior is gated to regions where
+the source is flat across a 5-pixel window, so detail and dither noise
+elsewhere are untouched. Useful range is 0.25-0.5; 0 = off (default).
+Requires the DP encoder: it is rejected with `--ham-fast` and with the
+palette-aware HAM dithers (`opt-checker`, Yliluuma...).
+
+**HAM op-selection metric** (`--ham-metric`): the default `oklab2` is
+perceptual OKLab², where lightness (L) is already the dominant axis and
+chroma (a/b) is separate — it is *not* an equal-weight RGB distance.
+`srgb-mse` is the unweighted sRGB-MSE alternative (PSNR-oriented).
+Two experimental scorers are available:
+
+- `abc342`: Leonard's abc-converter empirical weights (3·dr² + 4·dg² +
+  2·db² on 4-bit deltas). Measured on the 86 MI1 rooms it wins headline
+  PSNR but loses SSIMULACRA2 vs `oklab2` (base HAM6 −3.66 S2), so it is a
+  comparison option rather than a default.
+- `oklab-lum`: OKLab² with the lightness axis weighted 2×, prioritising a
+  smooth brightness ramp over chroma. On the same 86 rooms it improves
+  S2 by +2.32 on average for base HAM6 (77/86 rooms) and +0.21 with
+  atkinson (49/86), at some PSNR cost. It is the best of the tested
+  metrics for scenes whose banding is driven by luminance steps; the OCS
+  12-bit grid still sets the hard limit, so combine it with error
+  diffusion when the source is dithered.
+
 **Output**: `.png` preview, `.iff` ILBM (Amiga), `.pi1`/`.pi2`/`.pi3`
 Degas (Atari ST/STE), `.prg`/`.koa`/`.hir` (C64), `.bin` + `.h` (SNES
 tile/tilemap, Genesis SGDK), `.h` C header, `.cpp` standalone viewer
@@ -965,8 +994,12 @@ Cross-fade (lores/hires/EHB; --preview animates):
 HAM:
   --ham-beam <1-256>              DP search beam (default: 48)
   --ham-triple <0-256>            Triple-pixel refinement (default: 16)
+  --ham-smooth <0-8>              DP smoothness prior: penalise output
+                                  jumps beyond the source's local change
+                                  (0 = off; tries to keep gradients soft)
   --ham-fast                      Greedy encoder (no DP search)
-  --ham-metric <oklab2|srgb-mse>  Op-selection metric (default: oklab2)
+  --ham-metric <name>             oklab2 (default) | oklab-lum |
+                                  srgb-mse | abc342
 
 Platform-specific:
   --native-par                    Letterbox / pillarbox to preserve

@@ -180,6 +180,13 @@ dither::Method parse_dither(const std::string& s) {
     return dither::parse_method_or_null(s).value_or(dither::Method::floyd_steinberg);
 }
 
+ham::HamMetric parse_ham_metric(const std::string& s) {
+    if (s == "srgb-mse") return ham::HamMetric::srgb_mse;
+    if (s == "abc342") return ham::HamMetric::abc342;
+    if (s == "oklab-lum") return ham::HamMetric::oklab_lum;
+    return ham::HamMetric::oklab2;
+}
+
 // Crop an image to a sub-region
 Result<Image> crop_image(
     const Image& src, std::size_t cx, std::size_t cy, std::size_t cw, std::size_t ch) {
@@ -2891,9 +2898,9 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
         ham_opts.palette_diversity = options.palette_diversity;
         ham_opts.quantizer = options.quantizer;
         ham_opts.triple_beam = static_cast<std::size_t>(std::clamp(options.ham_triple, 0, 256));
+        ham_opts.smooth_transitions = std::clamp(options.ham_smooth, 0.0f, 8.0f);
         ham_opts.greedy = options.ham_fast;
-        ham_opts.metric = (options.ham_metric == "oklab2") ? ham::HamMetric::oklab2
-                                                           : ham::HamMetric::srgb_mse;
+        ham_opts.metric = parse_ham_metric(options.ham_metric);
         // best only applies to HAM6 and HAM8 — HAM4/5/7 are skipped
         // because their tiny base palettes (4/8/32 colors) don't benefit
         // from the refined planner enough to justify the cost.
@@ -4361,6 +4368,12 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                 "--dpf lores depth=3, --mode ehb, or --mode ham6",
             }};
         }
+        if (strips_ham6 && options.ham_smooth > 0.0f) {
+            return std::unexpected{Error{
+                ErrorCode::invalid_option,
+                "--ham-smooth is not supported with HAM6 + --strips",
+            }};
+        }
         if (has_transparency) {
             for (std::size_t i = 0; i < tmask.size(); ++i)
                 if (tmask[i]) image->pixels()[i] = Color3f{0, 0, 0};
@@ -4394,8 +4407,7 @@ Result<PipelineResult> run_pipeline(const std::uint8_t* input_data,
                     options.sliced_vertical_dither,
                     options.best,
                     strips_user_pal_span,
-                    (options.ham_metric == "srgb-mse") ? ham::HamMetric::srgb_mse
-                                                       : ham::HamMetric::oklab2);
+                    parse_ham_metric(options.ham_metric));
             }
             if (strips_ehb) {
                 // strips-EHB reserves: build (idx, color) pairs for the

@@ -21,6 +21,7 @@ enum class ErrorCode : std::uint8_t {
     write_failed,
     unsupported_mode,
     invalid_depth,
+    invalid_option,
 };
 
 struct Error {

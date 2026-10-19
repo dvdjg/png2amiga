@@ -942,12 +942,20 @@ struct Config {
     // (sweet spot — plateau past that).
     std::size_t ham_triple = 16;
 
+    // Smoothness prior weight for the HAM DP (0 = off). Penalises an
+    // output op whose colour jumps farther from the previous output
+    // pixel than the source does locally — the way to keep soft
+    // gradients soft instead of banding in the limited HAM grid.
+    float ham_smooth = 0.0f;
+
     // HAM greedy encoder (skip DP beam search, ~20× faster, ~1 dB worse).
     bool ham_fast = false;
 
     // HAM op-selection metric. "oklab2" (default) optimises perceptual
-    // uniformity (better SSIMULACRA2); "srgb-mse" optimises headline
-    // PSNR. See api::Options.
+    // uniformity (better SSIMULACRA2); "oklab-lum" weights lightness 2x
+    // (smoother brightness ramps); "srgb-mse" optimises headline PSNR;
+    // "abc342" uses Leonard's empirical 3,4,2 RGB weights. See
+    // api::Options.
     std::string ham_metric = "oklab2";
 
     // Multi-restart best-quality sweep. Tries N jitter seeds × dither
@@ -1303,8 +1311,12 @@ void print_usage() {
         "HAM:\n"
         "  --ham-beam <1-256>              DP search beam (default: 48)\n"
         "  --ham-triple <0-256>            Triple-pixel refinement (default: 16)\n"
+        "  --ham-smooth <0-8>              DP smoothness prior: penalise output\n"
+        "                                  jumps beyond the source's local change\n"
+        "                                  (0 = off; tries to keep gradients soft)\n"
         "  --ham-fast                      Greedy encoder (no DP search)\n"
-        "  --ham-metric <oklab2|srgb-mse>  Op-selection metric (default: oklab2)\n"
+        "  --ham-metric <name>             oklab2 (default) | oklab-lum |\n"
+        "                                  srgb-mse | abc342\n"
         "\n"
         "Platform-specific:\n"
         "  --native-par                    Letterbox / pillarbox to preserve\n"
@@ -2219,12 +2231,18 @@ Result<Config> parse_args(int argc, char* argv[]) {
             } else if (arg == "--ham-triple") {
                 config.ham_triple = static_cast<std::size_t>(std::atoi(std::string(val).c_str()));
                 if (config.ham_triple > 256) config.ham_triple = 256;
+            } else if (arg == "--ham-smooth") {
+                config.ham_smooth = static_cast<float>(std::atof(std::string(val).c_str()));
+                if (config.ham_smooth < 0.0f) config.ham_smooth = 0.0f;
+                if (config.ham_smooth > 8.0f) config.ham_smooth = 8.0f;
             } else if (arg == "--ham-metric") {
                 config.ham_metric = std::string(val);
-                if (config.ham_metric != "srgb-mse" && config.ham_metric != "oklab2") {
+                if (config.ham_metric != "srgb-mse" && config.ham_metric != "oklab2" &&
+                    config.ham_metric != "oklab-lum" && config.ham_metric != "abc342") {
                     return std::unexpected{Error{ErrorCode::unsupported_mode,
                                                  std::format("Invalid --ham-metric '{}': use "
-                                                             "'srgb-mse' (default) or 'oklab2'",
+                                                             "'oklab2' (default), 'oklab-lum', "
+                                                             "'srgb-mse' or 'abc342'",
                                                              config.ham_metric)}};
                 }
             } else if (arg == "--palette-diversity") {
@@ -3037,6 +3055,7 @@ api::Options make_api_options(const Config& cfg) {
     opts.ham_metric = cfg.ham_metric;
     opts.ham_beam = static_cast<int>(cfg.ham_beam);
     opts.ham_triple = static_cast<int>(cfg.ham_triple);
+    opts.ham_smooth = cfg.ham_smooth;
     opts.refine_iterations = cfg.refine_iterations;
     opts.best = cfg.best;
     opts.copper = cfg.copper;

@@ -178,13 +178,19 @@ struct Options {
     int ham_beam = 16;    // beam width for DP search (1-256)
     int ham_triple = 16;  // triple-pixel refinement post-pass
                           // beam width (0 = off, 16 default)
+    float ham_smooth = 0.0f;  // smoothness prior weight for DP HAM
+                              // (0 = off; penalises output jumps
+                              // beyond the source's local change)
 
     // HAM op-selection metric. "oklab2" (default) uses perceptually-
     // uniform OKLab² distance — measured ~+9 SSIMULACRA2 points and
     // ~+3.5 OKLab-dB on banded content vs sRGB-MSE. "srgb-mse" optimises
     // headline sRGB-PSNR directly (~+0.5-1 dB nominal gain) but produces
     // visibly worse output per SSIMULACRA2 — only useful when reporting
-    // PSNR is the literal goal. Compile-time dispatched.
+    // PSNR is the literal goal. "oklab-lum" weights the OKLab lightness
+    // axis 2x (prioritise smooth brightness ramps; best S2 on flat HAM6
+    // gradients). "abc342" is Leonard's empirical 3,4,2 RGB weighting
+    // (PSNR-oriented; comparison option). Compile-time dispatched.
     std::string ham_metric = "oklab2";
 
     bool best = false;  // multi-candidate sliced planner +

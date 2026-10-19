@@ -919,6 +919,39 @@ sys.exit(0 if got==expect else (print(f'expected {expect}, got {got}') or 1))"
     )
     set_tests_properties("ham6-optimal-exists" PROPERTIES DEPENDS "ham6-optimal")
 
+    # --- HAM6 smoothness prior (gated DP + error diffusion) ---
+    add_test(
+        NAME "ham6-smooth"
+        COMMAND png2amiga --mode ham6 --dither atkinson --ham-smooth 0.5
+                ${PNG2AMIGA_TEST_INPUT}
+                ${CMAKE_BINARY_DIR}/test_ham6_smooth.png
+    )
+
+    # The smoothness prior lives inside the DP expander; combining it with
+    # the greedy encoder must fail loudly instead of silently ignoring it.
+    add_test(
+        NAME "ham6-smooth-rejected-fast"
+        COMMAND png2amiga --mode ham6 --ham-fast --ham-smooth 0.5
+                ${PNG2AMIGA_TEST_INPUT}
+                ${CMAKE_BINARY_DIR}/test_ham6_smooth_fast.png
+    )
+    set_tests_properties("ham6-smooth-rejected-fast" PROPERTIES WILL_FAIL TRUE)
+
+    # Alternate HAM op-selection metrics (lightness-weighted OKLab and the
+    # empirical abc 3-4-2 RGB weights from Leonard's converter).
+    add_test(
+        NAME "ham6-metric-oklab-lum"
+        COMMAND png2amiga --mode ham6 --ham-metric oklab-lum --dither atkinson
+                ${PNG2AMIGA_TEST_INPUT}
+                ${CMAKE_BINARY_DIR}/test_ham6_metric_lum.png
+    )
+    add_test(
+        NAME "ham6-metric-abc342"
+        COMMAND png2amiga --mode ham6 --ham-metric abc342 --dither atkinson
+                ${PNG2AMIGA_TEST_INPUT}
+                ${CMAKE_BINARY_DIR}/test_ham6_metric_abc.png
+    )
+
 
 
     # --- HAM6 dithered (greedy, Floyd-Steinberg) ---
