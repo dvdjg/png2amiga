@@ -663,6 +663,41 @@ every visible scanline runs a near-saturated MOVE stream through the
 displayed area — each band of activity is one scanline's sliced-palette
 reload in hblank plus ~19 mid-line swaps inside the visible area.
 
+## SHAM5b (flicker, 31 shades)
+
+Classic trick popularised by Leonard's abc-bitmap-converter: quantise the
+source to RGB555 with dithering, split every 5-bit channel into two
+RGB444 values (floor/ceil) with a checkerboard phase swap, encode both
+frames as SHAM (HAM6 + per-scanline copper palette), and flip them at
+50 Hz. The eye integrates the pair into ~31 shades per channel (~29791
+colours from an OCS 12-bit machine).
+
+`tools/sham5b.py` is the front-end; it delegates the two SHAM encodes to
+the binary and writes:
+
+  <prefix>-a.png / <prefix>-b.png   the two RGB444/SHAM frames
+  <prefix>-avg.png                  per-pixel average (what the eye sees)
+  <prefix>-flicker.gif              animated pair (50 Hz; see note)
+  <prefix>-flicker-60hz.png        APNG of the pair at 16.666 ms/frame
+
+```bash
+python tools/sham5b.py input.png --prefix out/title__sham5b --gif
+```
+
+Options: `--dither none|floyd-steinberg|sierra|jarvis|bayer` (default
+sierra, as abc), `--frame-ms` (default 16.666 ms, 60 Hz preview),
+`--slice-changes N`, `--best`, `--ham-metric`, `--ham-smooth`,
+`--keep-444`. The pair is written as two files because a static PNG
+cannot hold the temporal alternation; for Amiga playback the two frames
+are two buffers flipped at VBlank (a double-height HAM6+sliced image also
+works, as abc does). GIF stores delays in centiseconds, so 16.666 ms is
+not representable: the GIF is rounded to 20 ms and the APNG carries the
+exact 16.666 ms (17 ms) preview; pass `--frame-ms 10` if you want the
+GIF itself to run as fast as the display allows. Caveat: the 25 Hz
+hardware alternation is visible as flicker on large flat areas
+(inter-frame difference ~6/255 on the MI1 corpus); it is the trade for
+the extra shade resolution.
+
 ## Cross-fade between two images (`--fade-to`)
 
 Encode one bitmap and morph its palette toward a second image at
